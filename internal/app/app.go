@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -98,6 +99,19 @@ func (a *App) shutdown() {
 	defer cancel()
 	_ = a.server.Shutdown(shutdownCtx)
 	a.pool.Close()
+}
+
+func (a *App) Counters() *metrics.Counters {
+	return a.counters
+}
+
+func (a *App) SetRendererOutput(w io.Writer) {
+	if w == nil {
+		return
+	}
+	if a.renderer != nil {
+		a.renderer.SetOutput(w)
+	}
 }
 
 func buildInboundHandler(cfg *config.Config, base http.Handler) http.Handler {

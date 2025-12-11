@@ -27,6 +27,13 @@ func NewRenderer(sampler *metrics.Sampler, p *pool.Pool, refresh time.Duration) 
 	}
 }
 
+func (r *Renderer) SetOutput(out io.Writer) {
+	if out == nil {
+		return
+	}
+	r.out = out
+}
+
 func (r *Renderer) Start(ctx context.Context) {
 	ticker := time.NewTicker(r.refresh)
 	defer ticker.Stop()
