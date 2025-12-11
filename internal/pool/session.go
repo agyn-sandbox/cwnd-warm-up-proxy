@@ -44,12 +44,11 @@ type SessionState struct {
 type Session struct {
 	id       int
 	cfg      *config.Config
-	dialer   *upstream.Dialer
 	counters *metrics.Counters
 
 	mu     sync.RWMutex
 	conn   net.Conn
-	client *http2.ClientConn
+	client sessionClient
 	closed bool
 
 	controlCh chan controlMessage
@@ -58,9 +57,24 @@ type Session struct {
 	warmupWG   sync.WaitGroup
 	realActive atomic.Int64
 	burstReady atomic.Bool
+
+	dial func(context.Context) (*dialResult, error)
 }
 
-var errWarmupTerminated = errors.New("warmup terminated early")
+type sessionClient interface {
+	RoundTrip(*http.Request) (*http.Response, error)
+	Close() error
+}
+
+type dialResult struct {
+	rawConn net.Conn
+	client  sessionClient
+}
+
+var (
+	errWarmupStream = errors.New("warmup stream failure")
+	errWarmupConn   = errors.New("warmup connection failure")
+)
 
 const warmupRetryBackoff = 500 * time.Millisecond
 
@@ -80,9 +94,21 @@ func NewSession(id int, cfg *config.Config, dialer *upstream.Dialer, counters *m
 	s := &Session{
 		id:        id,
 		cfg:       cfg,
-		dialer:    dialer,
 		counters:  counters,
 		controlCh: make(chan controlMessage, 8),
+	}
+	if dialer != nil {
+		s.dial = func(ctx context.Context) (*dialResult, error) {
+			conn, err := dialer.Dial(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return &dialResult{rawConn: conn.RawConn, client: conn.Client}, nil
+		}
+	} else {
+		s.dial = func(context.Context) (*dialResult, error) {
+			return nil, errors.New("dial function not configured")
+		}
 	}
 	s.state.Store(SessionState{
 		ID:        id,
@@ -145,7 +171,7 @@ func (s *Session) reconnect(ctx context.Context) error {
 		st.LastError = ""
 	})
 
-	conn, err := s.dialer.Dial(ctx)
+	result, err := s.dial(ctx)
 	if err != nil {
 		s.markState(func(st *SessionState) {
 			st.Phase = WarmupPhaseError
@@ -162,8 +188,8 @@ func (s *Session) reconnect(ctx context.Context) error {
 	if s.conn != nil {
 		s.conn.Close()
 	}
-	s.conn = conn.RawConn
-	s.client = conn.Client
+	s.conn = result.rawConn
+	s.client = result.client
 	s.burstReady.Store(false)
 	s.mu.Unlock()
 
@@ -207,37 +233,15 @@ func (s *Session) warmupLoop(ctx context.Context) {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
 			}
-			if errors.Is(err, errWarmupTerminated) {
-				s.markState(func(st *SessionState) {
-					if s.burstReady.Load() {
-						st.Phase = WarmupPhaseBurst
-					} else {
-						st.Phase = WarmupPhaseContinuous
-					}
-					st.LastError = ""
-					st.Connected = true
-				})
-				if !sleepWithContext(ctx, warmupRetryBackoff) {
-					return
-				}
-				continue
-			}
-			s.markState(func(st *SessionState) {
-				st.Phase = WarmupPhaseError
-				st.LastError = err.Error()
-				st.Connected = false
-			})
-			if err := s.reconnect(ctx); err != nil {
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					return
-				}
+			if s.handleWarmupError(ctx, err) {
+				return
 			}
 			continue
 		}
 	}
 }
 
-func (s *Session) currentClient() *http2.ClientConn {
+func (s *Session) currentClient() sessionClient {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.client
@@ -249,7 +253,7 @@ func (s *Session) isClosed() bool {
 	return s.closed
 }
 
-func (s *Session) ensureClient(ctx context.Context) (*http2.ClientConn, error) {
+func (s *Session) ensureClient(ctx context.Context) (sessionClient, error) {
 	client := s.currentClient()
 	if client != nil {
 		return client, nil
@@ -312,7 +316,7 @@ type warmupResult struct {
 	err error
 }
 
-func (s *Session) runWarmupOnce(ctx context.Context, client *http2.ClientConn) error {
+func (s *Session) runWarmupOnce(ctx context.Context, client sessionClient) error {
 	pipeR, pipeW := io.Pipe()
 	req, err := http.NewRequestWithContext(ctx, s.cfg.WarmupMethod(), s.cfg.WarmupURL(), pipeR)
 	if err != nil {
@@ -353,13 +357,17 @@ func (s *Session) runWarmupOnce(ctx context.Context, client *http2.ClientConn) e
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
-		return fmt.Errorf("%w: %v", errWarmupTerminated, err)
+		classification := wrapWarmupError(err)
+		if res.err != nil && !errors.Is(res.err, context.Canceled) && !errors.Is(res.err, context.DeadlineExceeded) && isConnectionError(res.err) {
+			classification = wrapWarmupError(res.err)
+		}
+		return classification
 	}
 	if res.err != nil {
 		if errors.Is(res.err, context.Canceled) || errors.Is(res.err, context.DeadlineExceeded) {
 			return res.err
 		}
-		return fmt.Errorf("%w: %v", errWarmupTerminated, res.err)
+		return wrapWarmupError(res.err)
 	}
 	return nil
 }
@@ -583,4 +591,103 @@ func sleepWithContext(ctx context.Context, d time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+func (s *Session) handleWarmupError(ctx context.Context, err error) bool {
+	switch {
+	case errors.Is(err, errWarmupStream):
+		s.markState(func(st *SessionState) {
+			if s.burstReady.Load() {
+				st.Phase = WarmupPhaseBurst
+			} else {
+				st.Phase = WarmupPhaseContinuous
+			}
+			st.LastError = err.Error()
+			st.Paused = false
+			st.Connected = true
+		})
+		if !sleepWithContext(ctx, warmupRetryBackoff) {
+			return true
+		}
+		return false
+	case errors.Is(err, errWarmupConn):
+		s.markState(func(st *SessionState) {
+			st.Phase = WarmupPhaseError
+			st.LastError = err.Error()
+			st.Connected = false
+		})
+		if recErr := s.reconnect(ctx); recErr != nil {
+			if errors.Is(recErr, context.Canceled) || errors.Is(recErr, context.DeadlineExceeded) {
+				return true
+			}
+		}
+		return false
+	default:
+		s.markState(func(st *SessionState) {
+			st.Phase = WarmupPhaseError
+			st.LastError = err.Error()
+			st.Connected = false
+		})
+		if recErr := s.reconnect(ctx); recErr != nil {
+			if errors.Is(recErr, context.Canceled) || errors.Is(recErr, context.DeadlineExceeded) {
+				return true
+			}
+			if !sleepWithContext(ctx, 500*time.Millisecond) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func wrapWarmupError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if isStreamError(err) {
+		return fmt.Errorf("%w: %w", errWarmupStream, err)
+	}
+	if isConnectionError(err) {
+		return fmt.Errorf("%w: %w", errWarmupConn, err)
+	}
+	return fmt.Errorf("%w: %w", errWarmupStream, err)
+}
+
+func isStreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se http2.StreamError
+	if errors.As(err, &se) {
+		return true
+	}
+	if errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
+	return false
+}
+
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isStreamError(err) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	var goAway *http2.GoAwayError
+	if errors.As(err, &goAway) {
+		return true
+	}
+	var connErr http2.ConnectionError
+	if errors.As(err, &connErr) {
+		return true
+	}
+	return false
 }

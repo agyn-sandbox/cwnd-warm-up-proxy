@@ -3,11 +3,17 @@ package pool
 import (
 	"context"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2"
 
 	"github.com/agyn-sandbox/cwnd-warm-up-proxy/internal/config"
 	"github.com/agyn-sandbox/cwnd-warm-up-proxy/internal/metrics"
@@ -107,6 +113,174 @@ func TestBeginEndRealTraffic(t *testing.T) {
 	}
 }
 
+func TestWarmupStreamErrorRetriesWithoutReconnect(t *testing.T) {
+	cfg := loadTestConfig(t)
+	cfg.Pool.PerConnectionDwellMS = 0
+	cfg.Pool.WarmUpIntervalMS = 10
+	cfg.Pool.WarmUpSizeBytes = warmupChunkSize
+	counters := &metrics.Counters{}
+
+	streamErrSeen := make(chan struct{}, 1)
+	secondCall := make(chan struct{}, 1)
+
+	client := &scriptedClient{
+		handler: func(call int, req *http.Request) (*http.Response, error) {
+			if call == 1 {
+				_, _ = io.CopyN(io.Discard, req.Body, int64(cfg.Pool.WarmUpSizeBytes))
+				req.Body.Close()
+				select {
+				case streamErrSeen <- struct{}{}:
+				default:
+				}
+				return nil, &http2.StreamError{Code: http2.ErrCodeCancel}
+			}
+			go io.Copy(io.Discard, req.Body)
+			select {
+			case secondCall <- struct{}{}:
+			default:
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("ok")),
+			}, nil
+		},
+	}
+
+	var dialCalls atomic.Int32
+	session := &Session{
+		id:        1,
+		cfg:       cfg,
+		counters:  counters,
+		controlCh: make(chan controlMessage, 16),
+		dial: func(context.Context) (*dialResult, error) {
+			dialCalls.Add(1)
+			return &dialResult{rawConn: &fakeNetConn{}, client: client}, nil
+		},
+	}
+	session.state.Store(SessionState{ID: 1, TargetBPS: cfg.PerConnectionTargetBPS()})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := session.Start(ctx); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+
+	select {
+	case <-streamErrSeen:
+	case <-time.After(1 * time.Second):
+		t.Fatal("expected stream error on first warm-up attempt")
+	}
+
+	select {
+	case <-secondCall:
+	case <-time.After(1 * time.Second):
+		t.Fatal("expected warm-up retry without reconnect")
+	}
+
+	if got := dialCalls.Load(); got != 1 {
+		t.Fatalf("expected single dial, got %d", got)
+	}
+
+	session.controlCh <- controlMessage{typ: controlStop}
+	cancel()
+	session.Close()
+}
+
+func TestWarmupConnectionErrorTriggersReconnect(t *testing.T) {
+	cfg := loadTestConfig(t)
+	cfg.Pool.PerConnectionDwellMS = 0
+	cfg.Pool.WarmUpIntervalMS = 10
+	cfg.Pool.WarmUpSizeBytes = warmupChunkSize
+	counters := &metrics.Counters{}
+
+	firstCall := make(chan struct{}, 1)
+	secondClientCall := make(chan struct{}, 1)
+
+	client1 := &scriptedClient{
+		handler: func(call int, req *http.Request) (*http.Response, error) {
+			_, _ = io.CopyN(io.Discard, req.Body, int64(cfg.Pool.WarmUpSizeBytes))
+			req.Body.Close()
+			select {
+			case firstCall <- struct{}{}:
+			default:
+			}
+			return nil, io.EOF
+		},
+	}
+
+	client2 := &scriptedClient{
+		handler: func(call int, req *http.Request) (*http.Response, error) {
+			if call == 1 {
+				select {
+				case secondClientCall <- struct{}{}:
+				default:
+				}
+			}
+			go io.Copy(io.Discard, req.Body)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("ok")),
+			}, nil
+		},
+	}
+
+	var dialCalls atomic.Int32
+	clients := []*scriptedClient{client1, client2}
+	var mu sync.Mutex
+	session := &Session{
+		id:        2,
+		cfg:       cfg,
+		counters:  counters,
+		controlCh: make(chan controlMessage, 16),
+		dial: func(context.Context) (*dialResult, error) {
+			call := int(dialCalls.Load())
+			if call >= len(clients) {
+				call = len(clients) - 1
+			}
+			dialCalls.Add(1)
+			mu.Lock()
+			client := clients[call]
+			mu.Unlock()
+			return &dialResult{rawConn: &fakeNetConn{}, client: client}, nil
+		},
+	}
+	session.state.Store(SessionState{ID: 2, TargetBPS: cfg.PerConnectionTargetBPS()})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := session.Start(ctx); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+
+	select {
+	case <-firstCall:
+	case <-time.After(1 * time.Second):
+		t.Fatal("expected initial warm-up attempt")
+	}
+
+	select {
+	case <-secondClientCall:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected reconnect to second client")
+	}
+
+	if got := dialCalls.Load(); got < 2 {
+		t.Fatalf("expected at least two dials, got %d", got)
+	}
+
+	if client1.closeCount.Load() == 0 {
+		t.Fatal("expected first client to be closed on reconnect")
+	}
+
+	session.controlCh <- controlMessage{typ: controlStop}
+	cancel()
+	session.Close()
+}
+
 func loadTestConfig(t *testing.T) *config.Config {
 	t.Helper()
 	cfgContent := `{
@@ -142,3 +316,43 @@ func loadTestConfig(t *testing.T) *config.Config {
 	}
 	return cfg
 }
+
+type scriptedClient struct {
+	handler    func(int, *http.Request) (*http.Response, error)
+	calls      atomic.Int32
+	closeCount atomic.Int32
+}
+
+func (c *scriptedClient) RoundTrip(req *http.Request) (*http.Response, error) {
+	call := int(c.calls.Add(1))
+	if c.handler == nil {
+		return nil, io.EOF
+	}
+	return c.handler(call, req)
+}
+
+func (c *scriptedClient) Close() error {
+	c.closeCount.Add(1)
+	return nil
+}
+
+type fakeNetConn struct {
+	closed atomic.Bool
+}
+
+func (c *fakeNetConn) Read(b []byte) (int, error)  { return 0, io.EOF }
+func (c *fakeNetConn) Write(b []byte) (int, error) { return len(b), nil }
+func (c *fakeNetConn) Close() error {
+	c.closed.Store(true)
+	return nil
+}
+func (c *fakeNetConn) LocalAddr() net.Addr              { return fakeAddr("local") }
+func (c *fakeNetConn) RemoteAddr() net.Addr             { return fakeAddr("remote") }
+func (c *fakeNetConn) SetDeadline(time.Time) error      { return nil }
+func (c *fakeNetConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *fakeNetConn) SetWriteDeadline(time.Time) error { return nil }
+
+type fakeAddr string
+
+func (a fakeAddr) Network() string { return string(a) }
+func (a fakeAddr) String() string  { return string(a) }
