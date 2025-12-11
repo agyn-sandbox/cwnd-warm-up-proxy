@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"sync"
@@ -56,7 +57,12 @@ type Session struct {
 
 	warmupWG   sync.WaitGroup
 	realActive atomic.Int64
+	burstReady atomic.Bool
 }
+
+var errWarmupTerminated = errors.New("warmup terminated early")
+
+const warmupRetryBackoff = 500 * time.Millisecond
 
 type controlType int
 
@@ -158,6 +164,7 @@ func (s *Session) reconnect(ctx context.Context) error {
 	}
 	s.conn = conn.RawConn
 	s.client = conn.Client
+	s.burstReady.Store(false)
 	s.mu.Unlock()
 
 	s.markState(func(st *SessionState) {
@@ -200,12 +207,31 @@ func (s *Session) warmupLoop(ctx context.Context) {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
 			}
+			if errors.Is(err, errWarmupTerminated) {
+				s.markState(func(st *SessionState) {
+					if s.burstReady.Load() {
+						st.Phase = WarmupPhaseBurst
+					} else {
+						st.Phase = WarmupPhaseContinuous
+					}
+					st.LastError = ""
+					st.Connected = true
+				})
+				if !sleepWithContext(ctx, warmupRetryBackoff) {
+					return
+				}
+				continue
+			}
 			s.markState(func(st *SessionState) {
 				st.Phase = WarmupPhaseError
 				st.LastError = err.Error()
 				st.Connected = false
 			})
-			s.reconnect(ctx)
+			if err := s.reconnect(ctx); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return
+				}
+			}
 			continue
 		}
 	}
@@ -320,16 +346,28 @@ func (s *Session) runWarmupOnce(ctx context.Context, client *http2.ClientConn) e
 	}
 
 	res := <-resultCh
-	if err != nil {
-		return err
+	if s.isClosed() {
+		return nil
 	}
-	return res.err
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		return fmt.Errorf("%w: %v", errWarmupTerminated, err)
+	}
+	if res.err != nil {
+		if errors.Is(res.err, context.Canceled) || errors.Is(res.err, context.DeadlineExceeded) {
+			return res.err
+		}
+		return fmt.Errorf("%w: %v", errWarmupTerminated, res.err)
+	}
+	return nil
 }
 
 func (s *Session) streamWarmup(ctx context.Context, pipeW *io.PipeWriter) error {
-	targetBytesPerSecond := s.cfg.PerConnectionTargetBPS() / 8
+	targetBytesPerSecond := int(math.Ceil(float64(s.cfg.PerConnectionTargetBPS()) / 8.0))
 	if targetBytesPerSecond <= 0 {
-		targetBytesPerSecond = 1
+		return errors.New("derived per-connection byte rate must be > 0")
 	}
 	continuousLimiter := rate.NewLimiter(rate.Limit(targetBytesPerSecond), warmupChunkSize)
 	dwell := time.Duration(s.cfg.Pool.PerConnectionDwellMS) * time.Millisecond
@@ -345,12 +383,16 @@ func (s *Session) streamWarmup(ctx context.Context, pipeW *io.PipeWriter) error 
 
 	var (
 		paused     atomic.Bool
-		dwellTimer <-chan time.Time
+		dwellTimer *time.Timer
+		dwellCh    <-chan time.Time
 		ticker     *time.Ticker
 	)
 	defer func() {
 		if ticker != nil {
 			ticker.Stop()
+		}
+		if dwellTimer != nil {
+			dwellTimer.Stop()
 		}
 	}()
 
@@ -362,15 +404,17 @@ func (s *Session) streamWarmup(ctx context.Context, pipeW *io.PipeWriter) error 
 	}
 
 	state := WarmupPhaseContinuous
-	if dwell > 0 {
-		dwellTimer = time.After(dwell)
+	if s.burstReady.Load() || dwell <= 0 {
+		state = WarmupPhaseBurst
+		ticker = time.NewTicker(interval)
+		s.burstReady.Store(true)
 		s.markState(func(st *SessionState) {
 			st.Phase = state
 			st.Paused = false
 		})
 	} else {
-		state = WarmupPhaseBurst
-		ticker = time.NewTicker(interval)
+		dwellTimer = time.NewTimer(dwell)
+		dwellCh = dwellTimer.C
 		s.markState(func(st *SessionState) {
 			st.Phase = state
 			st.Paused = false
@@ -425,7 +469,7 @@ func (s *Session) streamWarmup(ctx context.Context, pipeW *io.PipeWriter) error 
 		}
 
 		if state == WarmupPhaseContinuous {
-			if dwellTimer != nil {
+			if dwellCh != nil {
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
@@ -443,9 +487,14 @@ func (s *Session) streamWarmup(ctx context.Context, pipeW *io.PipeWriter) error 
 					case controlStop:
 						return nil
 					}
-				case <-dwellTimer:
-					dwellTimer = nil
+				case <-dwellCh:
+					dwellCh = nil
+					if dwellTimer != nil {
+						dwellTimer.Stop()
+						dwellTimer = nil
+					}
 					state = WarmupPhaseBurst
+					s.burstReady.Store(true)
 					s.markState(func(st *SessionState) {
 						st.Phase = state
 					})
@@ -520,4 +569,18 @@ func writeFull(w io.Writer, data []byte) error {
 		total += n
 	}
 	return nil
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }

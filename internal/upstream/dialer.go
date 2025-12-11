@@ -51,6 +51,10 @@ func (d *Dialer) Dial(ctx context.Context) (*SessionConn, error) {
 			conn.Close()
 			return nil, fmt.Errorf("tls handshake: %w", err)
 		}
+		if proto := tlsConn.ConnectionState().NegotiatedProtocol; proto != "h2" {
+			tlsConn.Close()
+			return nil, fmt.Errorf("tls handshake: upstream negotiated %q instead of h2", proto)
+		}
 		conn = tlsConn
 	}
 

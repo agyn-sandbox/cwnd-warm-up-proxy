@@ -24,17 +24,24 @@ func NewHandler(cfg *config.Config, pool *pool.Pool, counters *metrics.Counters)
 	return &Handler{cfg: cfg, pool: pool, counters: counters}
 }
 
-var hopByHopHeaders = map[string]struct{}{
-	"Connection":          {},
-	"Proxy-Connection":    {},
-	"Keep-Alive":          {},
-	"Proxy-Authenticate":  {},
-	"Proxy-Authorization": {},
-	"TE":                  {},
-	"Trailer":             {},
-	"Transfer-Encoding":   {},
-	"Upgrade":             {},
-}
+var hopByHopHeaders = func() map[string]struct{} {
+	keys := []string{
+		"Connection",
+		"Proxy-Connection",
+		"Keep-Alive",
+		"Proxy-Authenticate",
+		"Proxy-Authorization",
+		"TE",
+		"Trailer",
+		"Transfer-Encoding",
+		"Upgrade",
+	}
+	canonical := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		canonical[http.CanonicalHeaderKey(k)] = struct{}{}
+	}
+	return canonical
+}()
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -182,14 +189,30 @@ func stripHopByHop(h http.Header) {
 	if h == nil {
 		return
 	}
-	if connection := h.Get("Connection"); connection != "" {
-		for _, token := range strings.Split(connection, ",") {
-			h.Del(strings.TrimSpace(token))
+	if values := h.Values("Connection"); len(values) > 0 {
+		for _, value := range values {
+			for _, token := range strings.Split(value, ",") {
+				key := http.CanonicalHeaderKey(strings.TrimSpace(token))
+				if key == "" {
+					continue
+				}
+				if strings.EqualFold(key, "Te") {
+					filterTE(h)
+					continue
+				}
+				h.Del(key)
+			}
 		}
+		h.Del("Connection")
 	}
 	for k := range hopByHopHeaders {
+		if k == "Te" {
+			filterTE(h)
+			continue
+		}
 		h.Del(k)
 	}
+	filterTE(h)
 }
 
 type countingReadCloser struct {
@@ -226,10 +249,10 @@ func copyHeaders(dst, src http.Header) {
 		dst.Del(k)
 	}
 	for k, vv := range src {
+		if _, skip := hopByHopHeaders[http.CanonicalHeaderKey(k)]; skip {
+			continue
+		}
 		for _, v := range vv {
-			if _, skip := hopByHopHeaders[k]; skip {
-				continue
-			}
 			dst.Add(k, v)
 		}
 	}
@@ -241,5 +264,25 @@ func isIdempotentMethod(method string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func filterTE(h http.Header) {
+	values := h.Values("Te")
+	if len(values) == 0 {
+		return
+	}
+	keepTrailers := false
+	for _, v := range values {
+		for _, token := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "trailers") {
+				keepTrailers = true
+			}
+		}
+	}
+	if keepTrailers {
+		h.Set("Te", "trailers")
+	} else {
+		h.Del("Te")
 	}
 }
