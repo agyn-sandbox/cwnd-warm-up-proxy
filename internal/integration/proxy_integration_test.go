@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -78,6 +79,9 @@ func TestProxyEndToEnd(t *testing.T) {
 	if string(body) != "payload" {
 		t.Fatalf("unexpected echo body %q", string(body))
 	}
+	if resp.ProtoMajor != 1 {
+		t.Fatalf("expected HTTP/1.x response, got %s", resp.Proto)
+	}
 
 	echoHeaders := upstream.WaitForEchoHeaders(t)
 	if got := echoHeaders.Get("X-Test"); got != "tester" {
@@ -91,6 +95,59 @@ func TestProxyEndToEnd(t *testing.T) {
 	}
 	if got := echoHeaders.Values("Te"); len(got) != 1 || got[0] != "trailers" {
 		t.Fatalf("expected TE header limited to trailers, got %v", got)
+	}
+
+	// Perform h2c request to exercise HTTP/2 inbound path.
+	h2Transport := &http2.Transport{
+		AllowHTTP: true,
+		DialTLS: func(network, addr string, _ *tls.Config) (net.Conn, error) {
+			dialer := &net.Dialer{Timeout: 2 * time.Second}
+			return dialer.Dial(network, addr)
+		},
+	}
+	h2Client := &http.Client{
+		Timeout:   3 * time.Second,
+		Transport: h2Transport,
+	}
+	defer h2Client.CloseIdleConnections()
+	defer h2Transport.CloseIdleConnections()
+
+	h2Req, err := http.NewRequest(http.MethodPost, baseURL+"/echo?msg=h2", strings.NewReader("h2payload"))
+	if err != nil {
+		t.Fatalf("new h2 request: %v", err)
+	}
+	h2Req.Header.Set("X-Test-H2", "h2-client")
+	h2Req.Header.Set("Connection", "keep-alive")
+	h2Req.Header.Set("Te", "trailers")
+
+	h2Resp, err := h2Client.Do(h2Req)
+	if err != nil {
+		t.Fatalf("h2 echo request: %v", err)
+	}
+	h2Body, err := io.ReadAll(h2Resp.Body)
+	h2Resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read h2 echo body: %v", err)
+	}
+	if h2Resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from h2 echo, got %d", h2Resp.StatusCode)
+	}
+	if string(h2Body) != "h2payload" {
+		t.Fatalf("unexpected h2 echo body %q", string(h2Body))
+	}
+	if h2Resp.ProtoMajor != 2 {
+		t.Fatalf("expected HTTP/2 response, got %s", h2Resp.Proto)
+	}
+
+	echoHeadersH2 := upstream.WaitForEchoHeaders(t)
+	if got := echoHeadersH2.Get("X-Test-H2"); got != "h2-client" {
+		t.Fatalf("expected X-Test-H2 header preserved, got %q", got)
+	}
+	if got := echoHeadersH2.Get("Connection"); got != "" {
+		t.Fatalf("expected Connection header stripped for h2, got %q", got)
+	}
+	if got := echoHeadersH2.Values("Te"); len(got) != 1 || got[0] != "trailers" {
+		t.Fatalf("expected h2 TE header limited to trailers, got %v", got)
 	}
 
 	// GET /status via proxy for additional smoke coverage.
