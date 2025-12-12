@@ -67,3 +67,18 @@ CGO_ENABLED=0 go vet ./...
 ```
 
 Unit tests cover warm-up pause/resume behaviour, session prioritisation for real traffic, and metrics window/formatting logic. Additional integration testing should validate dummy traffic pacing and TUI output against real upstream targets.
+
+## Upload Test Server
+
+A standalone upload test server lives under [`cmd/testserver`](cmd/testserver) for validating upstream handling.
+
+- `GET /` serves a simple HTML form for selecting a file to upload.
+- `POST /upload` streams multipart file data to completion and reports the received size plus time-to-receive.
+
+While running, the server renders a terminal dashboard (refresh ~500 ms) with a 10-second sliding window showing total uploads, inbound bandwidth (bytes/s and Mbps), and the latest upload’s size/duration. Start it with:
+
+```bash
+go run ./cmd/testserver -port 8081
+```
+
+Flags such as `-require_h2` (force HTTP/2 clients) and `-h2c=false` (disable cleartext HTTP/2) help exercise different inbound protocols.
