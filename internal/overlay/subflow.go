@@ -60,6 +60,10 @@ func (s *Subflow) run() {
 			s.session.onSubflowError(s.ID, err)
 			return
 		}
+		if s.session.cfg.EnableChecksums && frame.Flags&protocol.FlagChecksumPresent == 0 {
+			s.session.onSubflowError(s.ID, fmt.Errorf("overlay: checksum required"))
+			return
+		}
 		if frame.Type == protocol.FrameData {
 			s.rx.Add(int64(len(frame.Payload)))
 		}
@@ -72,6 +76,9 @@ func (s *Subflow) send(frame *protocol.Frame) error {
 	defer s.wMu.Unlock()
 	if deadline := s.session.cfg.WriteTimeout; deadline > 0 {
 		_ = s.Conn.SetWriteDeadline(time.Now().Add(deadline))
+	}
+	if s.session.cfg.EnableChecksums {
+		frame.Flags |= protocol.FlagChecksumPresent
 	}
 	if err := frame.Encode(s.Conn); err != nil {
 		return fmt.Errorf("subflow %d write: %w", s.ID, err)

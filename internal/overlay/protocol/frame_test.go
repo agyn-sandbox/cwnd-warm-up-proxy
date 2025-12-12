@@ -118,6 +118,52 @@ func TestDecodeHeartbeat(t *testing.T) {
 	}
 }
 
+func TestEncodeDecodeWithChecksum(t *testing.T) {
+	buf := new(bytes.Buffer)
+	frame := &Frame{
+		Type:      FrameData,
+		Flags:     FlagEndOfStream | FlagChecksumPresent,
+		SessionID: 7,
+		StreamID:  3,
+		Seq:       42,
+		Payload:   []byte("checksum payload"),
+	}
+	if err := frame.Encode(buf); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	decoded, err := Decode(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.Flags&FlagChecksumPresent == 0 {
+		t.Fatalf("checksum flag missing")
+	}
+	if decoded.Checksum == 0 {
+		t.Fatalf("checksum not populated")
+	}
+	if !bytes.Equal(decoded.Payload, []byte("checksum payload")) {
+		t.Fatalf("payload mismatch: %s", decoded.Payload)
+	}
+}
+
+func TestDecodeChecksumMismatch(t *testing.T) {
+	buf := new(bytes.Buffer)
+	frame := &Frame{
+		Type:      FrameControl,
+		Flags:     FlagChecksumPresent,
+		SessionID: 1,
+		Control:   &ControlPayload{Type: ControlStreamClose},
+	}
+	if err := frame.Encode(buf); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	data := buf.Bytes()
+	data[len(data)-1] ^= 0xFF
+	if _, err := Decode(bytes.NewReader(data)); err == nil {
+		t.Fatalf("expected checksum mismatch")
+	}
+}
+
 func TestControlPayloadJSONRoundTrip(t *testing.T) {
 	original := ControlPayload{
 		Type:      ControlStreamOpen,

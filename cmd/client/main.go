@@ -21,6 +21,7 @@ type clientFlags struct {
 	frameSize int
 	window    int
 	showTUI   bool
+	useTLS    bool
 }
 
 func parseFlags() clientFlags {
@@ -31,6 +32,7 @@ func parseFlags() clientFlags {
 	flag.IntVar(&cfg.frameSize, "frame", 32<<10, "frame size in bytes")
 	flag.IntVar(&cfg.window, "window", 512<<10, "initial flow control window (bytes)")
 	flag.BoolVar(&cfg.showTUI, "tui", true, "render metrics dashboard")
+	flag.BoolVar(&cfg.useTLS, "tls", true, "use TLS for overlay subflows")
 	flag.Parse()
 	return cfg
 }
@@ -44,6 +46,7 @@ func main() {
 		InitialWindow:     uint32(cfg.window),
 		HeartbeatInterval: 5 * time.Second,
 		DialTimeout:       5 * time.Second,
+		Plaintext:         !cfg.useTLS,
 	})
 	if err != nil {
 		log.Fatalf("overlay client init: %v", err)
