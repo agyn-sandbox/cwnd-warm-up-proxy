@@ -39,6 +39,23 @@ func startServer(t *testing.T, cfg Config) (*Server, context.CancelFunc, <-chan 
 	return srv, cancel, errCh
 }
 
+func buildMultipartPayload(t *testing.T, fieldName, filename string, data []byte) (*bytes.Buffer, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, err := mw.CreateFormFile(fieldName, filename)
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	if _, err := fw.Write(data); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	return &buf, mw.FormDataContentType()
+}
+
 func stopServer(t *testing.T, cancel context.CancelFunc, errCh <-chan error) {
 	t.Helper()
 	cancel()
@@ -87,25 +104,14 @@ func TestUploadUpdatesStats(t *testing.T) {
 	client := &http.Client{Timeout: 2 * time.Second}
 	defer client.CloseIdleConnections()
 
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	fw, err := mw.CreateFormFile("file", "test.txt")
-	if err != nil {
-		t.Fatalf("create form file: %v", err)
-	}
 	payload := []byte("hello world")
-	if _, err := fw.Write(payload); err != nil {
-		t.Fatalf("write payload: %v", err)
-	}
-	if err := mw.Close(); err != nil {
-		t.Fatalf("close writer: %v", err)
-	}
+	buf, contentType := buildMultipartPayload(t, "file", "test.txt", payload)
 
-	req, err := http.NewRequest(http.MethodPost, "http://"+srv.Address()+"/upload", &buf)
+	req, err := http.NewRequest(http.MethodPost, "http://"+srv.Address()+"/upload", buf)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Content-Type", contentType)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -174,17 +180,41 @@ func TestH2CSupportsUpload(t *testing.T) {
 	defer client.CloseIdleConnections()
 	defer transport.CloseIdleConnections()
 
-	req, err := http.NewRequest(http.MethodGet, "http://"+srv.Address()+"/", nil)
+	payload := []byte("upload over h2c")
+	buf, contentType := buildMultipartPayload(t, "file", "h2c.txt", payload)
+	req, err := http.NewRequest(http.MethodPost, "http://"+srv.Address()+"/upload", buf)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
+	req.Header.Set("Content-Type", contentType)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		t.Fatalf("h2c get: %v", err)
+		t.Fatalf("h2c upload: %v", err)
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.ProtoMajor != 2 {
 		t.Fatalf("expected HTTP/2 response, got %s", resp.Proto)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	}
+
+	var output struct {
+		Bytes uint64 `json:"bytes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&output); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if output.Bytes != uint64(len(payload)) {
+		t.Fatalf("expected bytes %d, got %d", len(payload), output.Bytes)
+	}
+
+	snap := srv.Stats().Snapshot()
+	if snap.TotalUploads != 1 {
+		t.Fatalf("expected total uploads 1, got %d", snap.TotalUploads)
+	}
+	if snap.TotalBytes != uint64(len(payload)) {
+		t.Fatalf("expected total bytes %d, got %d", len(payload), snap.TotalBytes)
 	}
 }
