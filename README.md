@@ -58,6 +58,56 @@ See SPEC.md for the detailed technical specification (v0.1).
    curl --socks5 127.0.0.1:1080 https://example.com/
    ```
 
+## No-TLS quickstart (local testing)
+
+For loopback experiments you can disable TLS on the overlay. The transport falls
+back to plaintext TCP and automatically enables CRC32C checksums on every
+frame.
+
+1. **Start the test target** (if not already running):
+
+   ```bash
+   go run ./cmd/test-target -listen 127.0.0.1:9000
+   ```
+
+2. **Start the overlay server in plaintext mode**:
+
+   ```bash
+   go run ./cmd/server \
+     -listen 127.0.0.1:8443 \
+     -tls=false \
+     -subflows 4
+   ```
+
+3. **Start the overlay client without TLS**:
+
+   ```bash
+   go run ./cmd/client \
+     -server 127.0.0.1:8443 \
+     -listen 127.0.0.1:1080 \
+     -subflows 4 \
+     -tls=false
+   ```
+
+4. **Send a direct upload** (reusing a known payload path):
+
+   ```bash
+   FILE=/tmp/test-consumer-plaintext.txt
+   go run ./cmd/test-consumer \
+     -target http://127.0.0.1:9000/upload \
+     -file "$FILE"
+   ```
+
+5. **Send the same file through SOCKS**:
+
+   ```bash
+   go run ./cmd/test-consumer \
+     -target http://127.0.0.1:9000/upload \
+     -use-socks \
+     -socks 127.0.0.1:1080 \
+     -file "$FILE"
+   ```
+
 ## Full local walkthrough (test harness)
 
 The repository ships two helper binaries to exercise the overlay end-to-end:

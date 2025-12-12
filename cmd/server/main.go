@@ -20,37 +20,45 @@ type serverFlags struct {
 	frameSize int
 	window    int
 	showTUI   bool
+	useTLS    bool
 }
 
 func parseServerFlags() serverFlags {
 	var cfg serverFlags
-	flag.StringVar(&cfg.listen, "listen", ":443", "TLS listen address")
+	flag.StringVar(&cfg.listen, "listen", ":443", "overlay listen address")
 	flag.StringVar(&cfg.certFile, "cert", "server.crt", "TLS certificate path")
 	flag.StringVar(&cfg.keyFile, "key", "server.key", "TLS private key path")
 	flag.IntVar(&cfg.frameSize, "frame", 32<<10, "frame size in bytes")
 	flag.IntVar(&cfg.window, "window", 512<<10, "initial window bytes")
 	flag.BoolVar(&cfg.showTUI, "tui", true, "render metrics dashboard")
+	flag.BoolVar(&cfg.useTLS, "tls", true, "enable TLS for subflows")
 	flag.Parse()
 	return cfg
 }
 
 func main() {
 	cfg := parseServerFlags()
-	certificate, err := tls.LoadX509KeyPair(cfg.certFile, cfg.keyFile)
-	if err != nil {
-		log.Fatalf("load tls certificate: %v", err)
+	var tlsConf *tls.Config
+	if cfg.useTLS {
+		certificate, err := tls.LoadX509KeyPair(cfg.certFile, cfg.keyFile)
+		if err != nil {
+			log.Fatalf("load tls certificate: %v", err)
+		}
+		tlsConf = &tls.Config{
+			Certificates: []tls.Certificate{certificate},
+			MinVersion:   tls.VersionTLS13,
+		}
 	}
-	server, err := overlay.NewServer(overlay.ServerConfig{
+	serverCfg := overlay.ServerConfig{
 		ListenAddr:        cfg.listen,
 		FrameSize:         cfg.frameSize,
 		InitialWindow:     uint32(cfg.window),
 		HeartbeatInterval: 5 * time.Second,
-		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{certificate},
-			MinVersion:   tls.VersionTLS13,
-		},
-		WriteTimeout: 5 * time.Second,
-	})
+		TLSConfig:         tlsConf,
+		WriteTimeout:      5 * time.Second,
+		Plaintext:         !cfg.useTLS,
+	}
+	server, err := overlay.NewServer(serverCfg)
 	if err != nil {
 		log.Fatalf("overlay server init: %v", err)
 	}
@@ -68,7 +76,11 @@ func main() {
 		server.Close()
 	}()
 
-	log.Printf("overlay server listening on %s", cfg.listen)
+	mode := "plaintext"
+	if cfg.useTLS {
+		mode = "TLS"
+	}
+	log.Printf("overlay server listening on %s (%s)", cfg.listen, mode)
 	if err := server.Serve(); err != nil {
 		log.Printf("server stopped: %v", err)
 	}

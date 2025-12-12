@@ -81,13 +81,34 @@ func main() {
 
 func ensurePayload(path string) (string, error) {
 	if path != "" {
-		return path, nil
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		} else if errors.Is(err, os.ErrNotExist) {
+			if err := writePayloadFile(path); err != nil {
+				return "", err
+			}
+			return path, nil
+		} else {
+			return "", err
+		}
 	}
 	name := fmt.Sprintf("test-consumer-%d.txt", time.Now().UnixNano())
 	tmpPath := filepath.Join(os.TempDir(), name)
-	file, err := os.Create(tmpPath)
-	if err != nil {
+	if err := writePayloadFile(tmpPath); err != nil {
 		return "", err
+	}
+	return tmpPath, nil
+}
+
+func writePayloadFile(path string) error {
+	if dir := filepath.Dir(path); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		return err
 	}
 	defer file.Close()
 	pattern := []byte("The quick brown fox jumps over the lazy dog. ")
@@ -99,14 +120,11 @@ func ensurePayload(path string) (string, error) {
 			chunk = pattern[:remain]
 		}
 		if _, err := file.Write(chunk); err != nil {
-			return "", err
+			return err
 		}
 		written += len(chunk)
 	}
-	if err := file.Sync(); err != nil {
-		return "", err
-	}
-	return tmpPath, nil
+	return file.Sync()
 }
 
 func newHTTPClient(cfg consumerFlags) (*http.Client, error) {

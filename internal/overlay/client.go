@@ -19,6 +19,7 @@ type ClientConfig struct {
 	DialTimeout       time.Duration
 	TLSConfig         *tls.Config
 	WriteTimeout      time.Duration
+	Plaintext         bool
 }
 
 type Client struct {
@@ -36,9 +37,6 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.InitialWindow == 0 {
 		cfg.InitialWindow = 512 << 10
 	}
-	if cfg.TLSConfig == nil {
-		cfg.TLSConfig = &tls.Config{InsecureSkipVerify: true}
-	}
 	sessCfg := SessionConfig{
 		Role:              RoleClient,
 		FrameSize:         cfg.FrameSize,
@@ -46,11 +44,23 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		HeartbeatInterval: cfg.HeartbeatInterval,
 		WriteTimeout:      cfg.WriteTimeout,
 		SubflowTarget:     cfg.Subflows,
+		EnableChecksums:   cfg.Plaintext,
 	}
 	client := &Client{cfg: cfg}
-	dialer := func() (net.Conn, error) {
-		d := &net.Dialer{Timeout: cfg.DialTimeout}
-		return tls.DialWithDialer(d, "tcp", cfg.ServerAddr, cfg.TLSConfig)
+	var dialer func() (net.Conn, error)
+	if cfg.Plaintext {
+		dialer = func() (net.Conn, error) {
+			d := &net.Dialer{Timeout: cfg.DialTimeout}
+			return d.Dial("tcp", cfg.ServerAddr)
+		}
+	} else {
+		if cfg.TLSConfig == nil {
+			cfg.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+		}
+		dialer = func() (net.Conn, error) {
+			d := &net.Dialer{Timeout: cfg.DialTimeout}
+			return tls.DialWithDialer(d, "tcp", cfg.ServerAddr, cfg.TLSConfig)
+		}
 	}
 	sess, err := NewClientSession(sessCfg, dialer)
 	if err != nil {

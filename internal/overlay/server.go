@@ -19,6 +19,7 @@ type ServerConfig struct {
 	HeartbeatInterval time.Duration
 	TLSConfig         *tls.Config
 	WriteTimeout      time.Duration
+	Plaintext         bool
 }
 
 type Server struct {
@@ -51,10 +52,16 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.InitialWindow == 0 {
 		cfg.InitialWindow = 512 << 10
 	}
-	if cfg.TLSConfig == nil {
-		return nil, errors.New("overlay: server TLS configuration required")
+	var ln net.Listener
+	var err error
+	if cfg.Plaintext {
+		ln, err = net.Listen("tcp", cfg.ListenAddr)
+	} else {
+		if cfg.TLSConfig == nil {
+			return nil, errors.New("overlay: server TLS configuration required")
+		}
+		ln, err = tls.Listen("tcp", cfg.ListenAddr, cfg.TLSConfig)
 	}
-	ln, err := tls.Listen("tcp", cfg.ListenAddr, cfg.TLSConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -91,6 +98,10 @@ func (s *Server) handleConn(conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
+	if s.cfg.Plaintext && frame.Flags&protocol.FlagChecksumPresent == 0 {
+		_ = conn.Close()
+		return
+	}
 	sessionID := frame.SessionID
 	var sess *Session
 	s.sessionsMu.Lock()
@@ -103,6 +114,7 @@ func (s *Server) handleConn(conn net.Conn) {
 			InitialWindow:     s.cfg.InitialWindow,
 			HeartbeatInterval: s.cfg.HeartbeatInterval,
 			WriteTimeout:      s.cfg.WriteTimeout,
+			EnableChecksums:   s.cfg.Plaintext,
 		}
 		sess = NewServerSession(sessCfg)
 		s.sessions[sessionID] = sess

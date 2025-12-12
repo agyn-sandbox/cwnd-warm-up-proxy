@@ -59,8 +59,50 @@ func TestOverlayEchoIntegration(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 	sess := client.Session()
+	exerciseEchoTransfer(t, sess, echoListener.Addr().String())
+}
 
-	stream, err := sess.OpenStream(echoListener.Addr().String())
+func TestOverlayEchoIntegrationPlaintext(t *testing.T) {
+	echoListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("echo listen: %v", err)
+	}
+	defer echoListener.Close()
+	go runEchoServer(echoListener)
+
+	server, err := NewServer(ServerConfig{
+		ListenAddr:        "127.0.0.1:0",
+		FrameSize:         32 << 10,
+		InitialWindow:     512 << 10,
+		HeartbeatInterval: time.Second,
+		Plaintext:         true,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	defer server.Close()
+	go func() {
+		_ = server.Serve()
+	}()
+
+	client, err := NewClient(ClientConfig{
+		ServerAddr:        server.Addr().String(),
+		Subflows:          3,
+		FrameSize:         16 << 10,
+		InitialWindow:     256 << 10,
+		HeartbeatInterval: time.Second,
+		DialTimeout:       3 * time.Second,
+		Plaintext:         true,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	sess := client.Session()
+	exerciseEchoTransfer(t, sess, echoListener.Addr().String())
+}
+
+func exerciseEchoTransfer(t *testing.T, sess *Session, target string) {
+	stream, err := sess.OpenStream(target)
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}

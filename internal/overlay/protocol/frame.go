@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 )
 
@@ -41,7 +42,8 @@ const (
 
 // Frame flags.
 const (
-	FlagEndOfStream uint8 = 0x01
+	FlagEndOfStream     uint8 = 0x01
+	FlagChecksumPresent uint8 = 0x02
 )
 
 // ControlType identifies the semantic meaning of a control frame payload.
@@ -67,6 +69,7 @@ type Frame struct {
 	StreamID  uint32
 	Seq       uint64
 	Payload   []byte
+	Checksum  uint32
 
 	Ack       *AckPayload
 	Control   *ControlPayload
@@ -111,6 +114,10 @@ var (
 	errPayloadMismatch    = errors.New("overlay/protocol: payload missing for frame type")
 )
 
+var (
+	crc32cTable = crc32.MakeTable(crc32.Castagnoli)
+)
+
 // Encode writes the frame into the provided writer.
 func (f *Frame) Encode(w io.Writer) error {
 	if f.Version == 0 {
@@ -135,11 +142,22 @@ func (f *Frame) Encode(w io.Writer) error {
 	if _, err := w.Write(header); err != nil {
 		return err
 	}
-	if len(payload) == 0 {
-		return nil
+	if len(payload) > 0 {
+		if _, err := w.Write(payload); err != nil {
+			return err
+		}
 	}
-	_, err = w.Write(payload)
-	return err
+	if f.Flags&FlagChecksumPresent != 0 {
+		sum := crc32.Update(0, crc32cTable, header)
+		sum = crc32.Update(sum, crc32cTable, payload)
+		f.Checksum = sum
+		var trailer [4]byte
+		binary.BigEndian.PutUint32(trailer[:], sum)
+		if _, err := w.Write(trailer[:]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // payloadBytes materialises the frame payload for writing.
@@ -208,12 +226,25 @@ func Decode(r io.Reader) (*Frame, error) {
 	if length > MaxPayloadSize {
 		return nil, errPayloadTooLarge
 	}
-	if length == 0 {
-		return frame, nil
+	var buf []byte
+	if length > 0 {
+		buf = make([]byte, length)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
 	}
-	buf := make([]byte, length)
-	if _, err := io.ReadFull(r, buf); err != nil {
-		return nil, err
+	if frame.Flags&FlagChecksumPresent != 0 {
+		var trailer [4]byte
+		if _, err := io.ReadFull(r, trailer[:]); err != nil {
+			return nil, err
+		}
+		expected := binary.BigEndian.Uint32(trailer[:])
+		sum := crc32.Update(0, crc32cTable, header)
+		sum = crc32.Update(sum, crc32cTable, buf)
+		if sum != expected {
+			return nil, fmt.Errorf("overlay/protocol: checksum mismatch (got %08x want %08x)", sum, expected)
+		}
+		frame.Checksum = expected
 	}
 	switch frame.Type {
 	case FrameData:

@@ -32,6 +32,7 @@ type SessionConfig struct {
 	HeartbeatInterval time.Duration
 	WriteTimeout      time.Duration
 	SubflowTarget     int
+	EnableChecksums   bool
 }
 
 // Dialer abstracts the transport used to create subflows on the client.
