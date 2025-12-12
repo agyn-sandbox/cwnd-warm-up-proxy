@@ -151,6 +151,14 @@ func (s *Session) Close() error {
 
 func (s *Session) registerSubflow(sf *Subflow) {
 	s.subflowsMu.Lock()
+	if s.closed.Load() {
+		s.subflowsMu.Unlock()
+		_ = sf.close()
+		return
+	}
+	if s.subflows == nil {
+		s.subflows = make(map[int]*Subflow)
+	}
 	if sf.ID >= s.nextSubflowID {
 		s.nextSubflowID = sf.ID + 1
 	}
