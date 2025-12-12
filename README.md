@@ -31,7 +31,7 @@ Save the following as `config.json`:
     "bandwidth_mbps": 100,
     "warm_up_interval_ms": 1000,
     "warm_up_size_bytes": 1048576,
-    "warmup_path": "/upload",
+    "warmup_path": "/warmup-upload",
     "warmup_method": "POST",
     "warm_up_headers": {},
     "per_connection_dwell_ms": 0
@@ -90,7 +90,7 @@ Provide a JSON configuration file via `--config` (the Quickstart example above i
     "bandwidth_mbps": 100,
     "warm_up_interval_ms": 1000,
     "warm_up_size_bytes": 1048576,
-    "warmup_path": "/upload",
+    "warmup_path": "/warmup-upload",
     "warmup_method": "POST",
     "per_connection_dwell_ms": 0,
     "warm_up_headers": {}

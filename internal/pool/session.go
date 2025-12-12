@@ -518,10 +518,13 @@ func (s *Session) streamWarmup(ctx context.Context, pipeW *io.PipeWriter) error 
 			if paused.Load() {
 				continue
 			}
-			if err := writeFull(pipeW, chunkBuf); err != nil {
+			written, err := writeFull(pipeW, chunkBuf)
+			if written > 0 {
+				s.counters.AddDummyTx(uint64(written))
+			}
+			if err != nil {
 				return err
 			}
-			s.counters.AddDummyTx(uint64(warmupChunkSize))
 		} else {
 			if ticker == nil {
 				ticker = time.NewTicker(interval)
@@ -553,12 +556,15 @@ func (s *Session) streamWarmup(ctx context.Context, pipeW *io.PipeWriter) error 
 					if remaining < chunk {
 						chunk = remaining
 					}
-					if err := writeFull(pipeW, chunkBuf[:chunk]); err != nil {
+					written, err := writeFull(pipeW, chunkBuf[:chunk])
+					if written > 0 {
+						s.counters.AddDummyTx(uint64(written))
+					}
+					remaining -= written
+					if err != nil {
 						ticker.Stop()
 						return err
 					}
-					remaining -= chunk
-					s.counters.AddDummyTx(uint64(chunk))
 				}
 			}
 		}
@@ -567,16 +573,18 @@ func (s *Session) streamWarmup(ctx context.Context, pipeW *io.PipeWriter) error 
 
 const warmupChunkSize = 16 * 1024
 
-func writeFull(w io.Writer, data []byte) error {
+func writeFull(w io.Writer, data []byte) (int, error) {
 	total := 0
 	for total < len(data) {
 		n, err := w.Write(data[total:])
-		if err != nil {
-			return err
+		if n > 0 {
+			total += n
 		}
-		total += n
+		if err != nil {
+			return total, err
+		}
 	}
-	return nil
+	return total, nil
 }
 
 func sleepWithContext(ctx context.Context, d time.Duration) bool {
@@ -602,7 +610,7 @@ func (s *Session) handleWarmupError(ctx context.Context, err error) bool {
 			} else {
 				st.Phase = WarmupPhaseContinuous
 			}
-			st.LastError = err.Error()
+			st.LastError = ""
 			st.Paused = false
 			st.Connected = true
 		})
