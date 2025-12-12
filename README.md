@@ -4,6 +4,67 @@ A Go reverse proxy that pre-warms HTTP/2 connections to an upstream origin so bu
 
 See [SPEC.md](SPEC.md) for the authoritative technical specification.
 
+## Quickstart
+
+### 1. Launch the upload test server
+
+```bash
+go run ./cmd/testserver -port 9000
+```
+
+The test server listens on HTTP/1.1 and h2c simultaneously. Leave it running while you experiment; press <kbd>Ctrl</kbd>+<kbd>C</kbd> (or send SIGINT/SIGTERM) for a graceful shutdown with final metrics. Flag defaults (such as the port and h2c toggle) live in [`cmd/testserver/main.go`](cmd/testserver/main.go).
+
+### 2. Create a proxy configuration
+
+Save the following as `config.json`:
+
+```json
+{
+  "target": {
+    "host": "localhost",
+    "port": 9000,
+    "protocol": "http2",
+    "tls": false
+  },
+  "pool": {
+    "pool_size": 2,
+    "bandwidth_mbps": 100,
+    "warm_up_interval_ms": 1000,
+    "warm_up_size_bytes": 1048576,
+    "warmup_path": "/upload",
+    "warmup_method": "POST",
+    "warm_up_headers": {},
+    "per_connection_dwell_ms": 0
+  },
+  "server": {
+    "port": 8080,
+    "support_http1_1": true,
+    "support_h2c": true
+  }
+}
+```
+
+This sample points the proxy at the upload test server. [`internal/config/config.go`](internal/config/config.go) normalises headers and derives defaults (for example, choosing h2c automatically for cleartext targets). Adjust that file if you need different default behaviour when fields are omitted.
+
+### 3. Start the warm-up proxy
+
+```bash
+go run ./cmd/proxy --config ./config.json
+```
+
+Run this in a second terminal while the test server is active. Logs will show warm-up progress and upload metrics.
+
+### 4. Exercise the proxy
+
+- Open [http://localhost:8080/](http://localhost:8080/) in a browser to use the HTML upload form.
+- Upload a file via cURL:
+
+  ```bash
+  curl -F file=@/path/to/file http://localhost:8080/upload
+  ```
+
+Traffic flows through the proxy to the test server, which streams the file and updates its TUI dashboard.
+
 ## Features
 
 - Upload-only warm-up using persistent POST/PUT requests with configurable dummy headers.
@@ -14,27 +75,25 @@ See [SPEC.md](SPEC.md) for the authoritative technical specification.
 
 ## Configuration
 
-Provide a JSON configuration file via `--config`:
+Provide a JSON configuration file via `--config` (the Quickstart example above is a ready-to-run template):
 
 ```json
 {
   "target": {
-    "host": "upstream.local",
-    "port": 443,
+    "host": "localhost",
+    "port": 9000,
     "protocol": "http2",
-    "tls": true
+    "tls": false
   },
   "pool": {
-    "pool_size": 4,
-    "bandwidth_mbps": 800,
-    "warm_up_interval_ms": 500,
+    "pool_size": 2,
+    "bandwidth_mbps": 100,
+    "warm_up_interval_ms": 1000,
     "warm_up_size_bytes": 1048576,
-    "warmup_path": "/upload/sink",
+    "warmup_path": "/upload",
     "warmup_method": "POST",
-    "per_connection_dwell_ms": 1000,
-    "warm_up_headers": {
-      "X-Warmup": "true"
-    }
+    "per_connection_dwell_ms": 0,
+    "warm_up_headers": {}
   },
   "server": {
     "port": 8080,
