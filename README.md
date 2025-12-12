@@ -55,8 +55,92 @@ See SPEC.md for the detailed technical specification (v0.1).
 4. **Configure a tool or browser to use the SOCKS proxy.** For example:
 
    ```bash
-   curl --socks5 127.0.0.1:1080 https://example.com/
+  curl --socks5 127.0.0.1:1080 https://example.com/
+  ```
+
+## Full local walkthrough (test harness)
+
+The repository ships two helper binaries to exercise the overlay end-to-end:
+
+- `cmd/test-target`: a simple HTTP service that records uploads.
+- `cmd/test-consumer`: a CLI that pushes a 5 MiB text payload either directly to the target or through the SOCKS proxy and reports timings.
+
+Follow the steps below in separate terminals:
+
+1. **Start the test target (HTTP)**
+
+   ```bash
+   go run ./cmd/test-target -listen 127.0.0.1:9000
    ```
+
+   The service exposes `POST /upload` and `GET /health`. Leave it running.
+
+2. **(Once) Generate a TLS cert for the overlay server**
+
+   ```bash
+   openssl req -x509 -nodes -newkey rsa:2048 \
+     -keyout server.key -out server.crt -days 7 -subj '/CN=localhost'
+   ```
+
+3. **Start the overlay server near the target**
+
+   ```bash
+   go run ./cmd/server \
+     -listen 127.0.0.1:8443 \
+     -cert server.crt \
+     -key server.key \
+     -subflows 4
+   ```
+
+4. **Start the overlay client/SOCKS proxy near the consumer**
+
+   ```bash
+   go run ./cmd/client \
+     -server 127.0.0.1:8443 \
+     -listen 127.0.0.1:1080 \
+     -subflows 4
+   ```
+
+5. **Run the consumer *directly* to the target**
+
+   ```bash
+   go run ./cmd/test-consumer -target http://127.0.0.1:9000/upload
+   ```
+
+   The CLI creates a 5 MiB text file (path printed in the log), pushes it to
+   the target, and prints timings such as:
+
+   ```text
+   2025/01/10 12:00:01 generated payload file: /tmp/test-consumer-12345.txt
+   2025/01/10 12:00:02 mode: direct
+   2025/01/10 12:00:02 client_time_ms=842
+   2025/01/10 12:00:02 throughput_mibps=5.87
+   2025/01/10 12:00:02 server_bytes=5242880 server_time_ms=410
+   ```
+
+6. **Run the consumer through the SOCKS proxy**
+
+   Reuse the generated file to keep inputs identical:
+
+   ```bash
+   FILE=/tmp/test-consumer-12345.txt # from the direct run output
+   go run ./cmd/test-consumer \
+     -target http://127.0.0.1:9000/upload \
+     -use-socks \
+     -socks 127.0.0.1:1080 \
+     -file "$FILE"
+   ```
+
+   The mode line now reads `mode: SOCKS 127.0.0.1:1080`; compare timings with
+   the direct run.
+
+### Troubleshooting
+
+- Ensure all binaries are built/run with Go 1.22.7.
+- If the consumer reports `connection refused`, verify the overlay client and
+  server are running and that the server certificate matches the `CN` used.
+- Use `curl http://127.0.0.1:9000/health` to confirm the target service is up.
+- Terminate background processes with `Ctrl+C` after testing.
 
 ## Testing
 
