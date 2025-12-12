@@ -1,6 +1,9 @@
 package overlay
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // Scheduler chooses the next subflow to transmit on. We keep a simple weighted
 // round-robin that can adapt weights based on recent throughput.
@@ -43,14 +46,22 @@ func (s *Scheduler) Detach(subflowID int) {
 	}
 }
 
-func (s *Scheduler) Record(subflowID int, bytes int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+const (
+	minWeight     = 1
+	maxWeight     = 8
+	weightQuantum = 64 << 10 // bytes per second step
+	goodputWindow = 10 * time.Second
+)
+
+func (s *Scheduler) refreshWeightsLocked() {
 	for _, entry := range s.entries {
-		if entry.ref.ID == subflowID {
-			entry.weight = clamp(entry.weight+1, 1, 8)
+		throughput := entry.ref.tx.Sum()
+		weight := weightFromThroughput(throughput)
+		if weight != entry.weight {
+			entry.weight = weight
+			entry.quota = weight
+		} else if entry.quota <= 0 {
 			entry.quota = entry.weight
-			break
 		}
 	}
 }
@@ -61,25 +72,34 @@ func (s *Scheduler) Next() *Subflow {
 	if len(s.entries) == 0 {
 		return nil
 	}
-	for i := 0; i < len(s.entries); i++ {
-		s.position = (s.position + 1) % len(s.entries)
+	s.refreshWeightsLocked()
+	for range s.entries {
 		entry := s.entries[s.position]
-		if entry.quota > 0 {
-			entry.quota--
-			return entry.ref
+		if entry.quota == 0 {
+			entry.quota = entry.weight
+			s.position = (s.position + 1) % len(s.entries)
+			continue
 		}
-		entry.quota = entry.weight
+		entry.quota--
+		if entry.quota == 0 {
+			s.position = (s.position + 1) % len(s.entries)
+		}
+		return entry.ref
 	}
-	return s.entries[s.position].ref
+	return s.entries[0].ref
 }
 
-func clamp(v, min, max int) int {
-	if v < min {
-		return min
+func weightFromThroughput(bytes int64) int {
+	if bytes <= 0 {
+		return minWeight
 	}
-	if v > max {
-		return max
+	rate := float64(bytes) / goodputWindow.Seconds()
+	weight := int(rate/float64(weightQuantum)) + 1
+	if weight < minWeight {
+		return minWeight
 	}
-	return v
+	if weight > maxWeight {
+		return maxWeight
+	}
+	return weight
 }
-

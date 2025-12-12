@@ -23,6 +23,10 @@ const (
 	// allocations when decoding frames. The scheduler keeps payloads under this
 	// size, so attempts to decode larger payloads are treated as protocol errors.
 	MaxPayloadSize = 1 << 20 // 1 MiB
+
+	// MaxSACKRanges caps the number of selective acknowledgement ranges carried
+	// in a single ACK frame.
+	MaxSACKRanges = 4
 )
 
 // FrameType represents the 1-byte type field in the frame header.
@@ -33,6 +37,11 @@ const (
 	FrameAck       FrameType = 0x02
 	FrameControl   FrameType = 0x03
 	FrameHeartbeat FrameType = 0x04
+)
+
+// Frame flags.
+const (
+	FlagEndOfStream uint8 = 0x01
 )
 
 // ControlType identifies the semantic meaning of a control frame payload.
@@ -66,8 +75,16 @@ type Frame struct {
 
 // AckPayload describes the payload carried in ACK frames.
 type AckPayload struct {
-	AckSeq uint64 `json:"ack_seq"`
-	Credit uint32 `json:"credit"`
+	AckSeq uint64      `json:"ack_seq"`
+	Credit uint32      `json:"credit"`
+	Ranges []SACKRange `json:"ranges,omitempty"`
+}
+
+// SACKRange represents an inclusive-exclusive byte range that has been
+// received by the peer beyond the cumulative AckSeq. Start<=End is required.
+type SACKRange struct {
+	Start uint64 `json:"start"`
+	End   uint64 `json:"end"`
 }
 
 // ControlPayload is JSON encoded inside control frames to keep the wire format
@@ -137,9 +154,21 @@ func (f *Frame) payloadBytes() ([]byte, error) {
 		if f.Ack == nil {
 			return nil, errPayloadMismatch
 		}
-		buf := make([]byte, 12)
+		ranges := f.Ack.Ranges
+		if len(ranges) > MaxSACKRanges {
+			ranges = ranges[:MaxSACKRanges]
+		}
+		buf := make([]byte, 16+len(ranges)*16)
 		binary.BigEndian.PutUint64(buf[0:8], f.Ack.AckSeq)
 		binary.BigEndian.PutUint32(buf[8:12], f.Ack.Credit)
+		buf[12] = uint8(len(ranges))
+		// bytes 13-15 reserved for alignment
+		offset := 16
+		for _, r := range ranges {
+			binary.BigEndian.PutUint64(buf[offset:offset+8], r.Start)
+			binary.BigEndian.PutUint64(buf[offset+8:offset+16], r.End)
+			offset += 16
+		}
 		return buf, nil
 	case FrameControl:
 		if f.Control == nil {
@@ -190,12 +219,31 @@ func Decode(r io.Reader) (*Frame, error) {
 	case FrameData:
 		frame.Payload = buf
 	case FrameAck:
-		if len(buf) != 12 {
+		if len(buf) < 16 || (len(buf)-16)%16 != 0 {
 			return nil, fmt.Errorf("overlay/protocol: invalid ack payload length %d", len(buf))
+		}
+		rangeCount := int(buf[12])
+		expectedLen := 16 + rangeCount*16
+		if len(buf) != expectedLen {
+			return nil, fmt.Errorf("overlay/protocol: ack payload length %d does not match range count %d", len(buf), rangeCount)
+		}
+		ranges := make([]SACKRange, min(rangeCount, MaxSACKRanges))
+		offset := 16
+		for i := 0; i < len(ranges); i++ {
+			r := SACKRange{
+				Start: binary.BigEndian.Uint64(buf[offset : offset+8]),
+				End:   binary.BigEndian.Uint64(buf[offset+8 : offset+16]),
+			}
+			if r.End < r.Start {
+				return nil, fmt.Errorf("overlay/protocol: invalid sack range %d: start %d > end %d", i, r.Start, r.End)
+			}
+			ranges[i] = r
+			offset += 16
 		}
 		frame.Ack = &AckPayload{
 			AckSeq: binary.BigEndian.Uint64(buf[0:8]),
 			Credit: binary.BigEndian.Uint32(buf[8:12]),
+			Ranges: ranges,
 		}
 	case FrameControl:
 		var payload ControlPayload
@@ -218,4 +266,11 @@ func Decode(r io.Reader) (*Frame, error) {
 // prototype grows additional helpers.
 func ReadFrame(r io.Reader) (*Frame, error) {
 	return Decode(r)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

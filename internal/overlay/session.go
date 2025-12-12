@@ -31,6 +31,7 @@ type SessionConfig struct {
 	InitialWindow     uint32
 	HeartbeatInterval time.Duration
 	WriteTimeout      time.Duration
+	SubflowTarget     int
 }
 
 // Dialer abstracts the transport used to create subflows on the client.
@@ -52,9 +53,11 @@ type Session struct {
 	streams   map[uint32]*Stream
 	streamsMu sync.RWMutex
 
-	subflows   map[int]*Subflow
-	subflowsMu sync.RWMutex
-	scheduler  *Scheduler
+	subflows      map[int]*Subflow
+	subflowsMu    sync.RWMutex
+	scheduler     *Scheduler
+	nextSubflowID int
+	pendingSpawns int
 
 	incoming chan inboundFrame
 	done     chan struct{}
@@ -148,27 +151,109 @@ func (s *Session) Close() error {
 
 func (s *Session) registerSubflow(sf *Subflow) {
 	s.subflowsMu.Lock()
+	if sf.ID >= s.nextSubflowID {
+		s.nextSubflowID = sf.ID + 1
+	}
+	if s.pendingSpawns > 0 {
+		s.pendingSpawns--
+	}
 	s.subflows[sf.ID] = sf
 	s.subflowsMu.Unlock()
 	s.scheduler.Attach(sf)
 	go sf.run()
 }
 
-func (s *Session) removeSubflow(id int) {
+func (s *Session) subflowCount() int {
+	s.subflowsMu.RLock()
+	defer s.subflowsMu.RUnlock()
+	return len(s.subflows)
+}
+
+func (s *Session) prepareSubflowSpawn() (id int, useInit bool, ok bool) {
+	if s.cfg.Role != RoleClient || s.Dialer == nil || s.cfg.SubflowTarget <= 0 {
+		return 0, false, false
+	}
 	s.subflowsMu.Lock()
+	defer func() {
+		if !ok {
+			s.subflowsMu.Unlock()
+		}
+	}()
+	if len(s.subflows)+s.pendingSpawns >= s.cfg.SubflowTarget {
+		ok = false
+		return 0, false, false
+	}
+	id = s.nextSubflowID
+	s.nextSubflowID++
+	useInit = len(s.subflows) == 0 && s.pendingSpawns == 0
+	s.pendingSpawns++
+	ok = true
+	s.subflowsMu.Unlock()
+	return id, useInit, true
+}
+
+func (s *Session) subflowSpawnFailed() {
+	s.subflowsMu.Lock()
+	if s.pendingSpawns > 0 {
+		s.pendingSpawns--
+	}
+	s.subflowsMu.Unlock()
+}
+
+func (s *Session) spawnReplacementSubflow() {
+	id, useInit, ok := s.prepareSubflowSpawn()
+	if !ok {
+		return
+	}
+	go s.dialSubflow(id, useInit)
+}
+
+func (s *Session) dialSubflow(id int, useInit bool) {
+	sf, err := newClientSubflow(id, s, s.Dialer)
+	if err != nil {
+		s.subflowSpawnFailed()
+		time.AfterFunc(time.Second, func() { s.spawnReplacementSubflow() })
+		return
+	}
+	frameType := protocol.ControlSessionJoin
+	if useInit {
+		frameType = protocol.ControlSessionInit
+	}
+	hello := &protocol.Frame{
+		Type:      protocol.FrameControl,
+		SessionID: s.id,
+		Control: &protocol.ControlPayload{
+			Type:      frameType,
+			SessionID: s.id,
+			Window:    s.cfg.InitialWindow,
+		},
+	}
+	if err := sf.send(hello); err != nil {
+		_ = sf.close()
+		s.subflowSpawnFailed()
+		time.AfterFunc(time.Second, func() { s.spawnReplacementSubflow() })
+		return
+	}
+	s.registerSubflow(sf)
+}
+
+func (s *Session) removeSubflow(id int) *Subflow {
+	s.subflowsMu.Lock()
+	sf := s.subflows[id]
 	delete(s.subflows, id)
 	s.subflowsMu.Unlock()
 	s.scheduler.Detach(id)
+	return sf
 }
 
 func (s *Session) onSubflowError(id int, err error) {
-	s.removeSubflow(id)
-	// Notify streams about failure so they can tear down gracefully.
-	s.streamsMu.RLock()
-	for _, stream := range s.streams {
-		stream.fail(err)
+	sf := s.removeSubflow(id)
+	if sf != nil {
+		_ = sf.close()
 	}
-	s.streamsMu.RUnlock()
+	if s.cfg.Role == RoleClient && s.Dialer != nil && s.cfg.SubflowTarget > 0 {
+		s.spawnReplacementSubflow()
+	}
 }
 
 func (s *Session) handleFrame(sf *Subflow, frame *protocol.Frame) {
@@ -343,33 +428,38 @@ func (s *Session) OpenStream(target string) (*Stream, error) {
 }
 
 // sendData transmits bytes for a stream respecting flow control limits.
-func (s *Session) sendData(stream *Stream, payload []byte) error {
-	seq, err := stream.reserveSequence(uint32(len(payload)))
+func (s *Session) sendData(stream *Stream, payload []byte, end bool) error {
+	entry, err := stream.queueFrame(payload, end)
 	if err != nil {
 		return err
 	}
-	frame := &protocol.Frame{
-		Type:      protocol.FrameData,
-		SessionID: s.id,
-		StreamID:  stream.id,
-		Seq:       seq,
-		Payload:   payload,
+	entry.frame.SessionID = s.id
+	if err := s.sendFrame(entry.frame); err != nil {
+		stream.onSendFailure(entry)
+		return err
 	}
-	return s.sendFrame(frame)
+	entry.lastSend = time.Now()
+	return nil
 }
 
 // sendAck sends an ack frame for the specified stream.
-func (s *Session) sendAck(streamID uint32, ackSeq uint64, credit uint32) error {
+func (s *Session) sendAck(streamID uint32, ack *protocol.AckPayload) error {
 	frame := &protocol.Frame{
 		Type:      protocol.FrameAck,
 		SessionID: s.id,
 		StreamID:  streamID,
-		Ack: &protocol.AckPayload{
-			AckSeq: ackSeq,
-			Credit: credit,
-		},
+		Ack:       ack,
 	}
 	return s.sendFrame(frame)
+}
+
+func (s *Session) retransmit(stream *Stream, entry *pendingEntry, now time.Time) {
+	entry.frame.SessionID = s.id
+	if err := s.sendFrame(entry.frame); err != nil {
+		stream.fail(err)
+		return
+	}
+	entry.lastSend = now
 }
 
 // Snapshot implements tui.Provider.

@@ -14,9 +14,16 @@ import (
 
 var errStreamClosed = errors.New("overlay: stream closed")
 
+const (
+	retransmitInterval            = 50 * time.Millisecond
+	defaultReorderCapacity uint32 = 256 << 10
+)
+
 type pendingEntry struct {
-	seq    uint64
-	length uint32
+	seq      uint64
+	length   uint32
+	frame    *protocol.Frame
+	lastSend time.Time
 }
 
 // Stream represents a bidirectional logical stream multiplexed across the
@@ -29,12 +36,12 @@ type Stream struct {
 	reorder    *ReorderBuffer
 
 	sendSeq uint64
-	recvSeq uint64
+	recvSeq atomic.Uint64
 
-	pending   []pendingEntry
+	pending   []*pendingEntry
 	pendingMu sync.Mutex
 
-	inbound chan []byte
+	inbound chan ReorderedChunk
 	done    chan struct{}
 
 	accepted chan struct{}
@@ -48,17 +55,30 @@ type Stream struct {
 	once      sync.Once
 	closeOnce sync.Once
 
+	sendClosed atomic.Bool
+	localDone  atomic.Bool
+	remoteDone atomic.Bool
+
 	throughput *metrics.SlidingCounter
 	inflight   atomic.Uint32
 }
 
 func newStream(sess *Session, id uint32) *Stream {
+	cap := sess.cfg.InitialWindow
+	if cap == 0 {
+		cap = defaultReorderCapacity
+	}
+	if cap > ^uint32(0)/2 {
+		cap = ^uint32(0)
+	} else {
+		cap *= 2
+	}
 	return &Stream{
 		session:    sess,
 		id:         id,
 		sendWindow: NewWindow(sess.cfg.InitialWindow),
-		reorder:    NewReorderBuffer(),
-		inbound:    make(chan []byte, 32),
+		reorder:    NewReorderBuffer(cap),
+		inbound:    make(chan ReorderedChunk, 32),
 		done:       make(chan struct{}),
 		accepted:   make(chan struct{}),
 		throughput: metrics.NewSlidingCounter(10*time.Second, 500*time.Millisecond),
@@ -109,54 +129,111 @@ func (s *Stream) Err() error {
 	return s.err
 }
 
-func (s *Stream) reserveSequence(length uint32) (uint64, error) {
-	if !s.sendWindow.Acquire(length) {
-		return 0, errStreamClosed
+func (s *Stream) queueFrame(payload []byte, end bool) (*pendingEntry, error) {
+	length := uint32(len(payload))
+	if end {
+		if s.sendClosed.Swap(true) {
+			return nil, errStreamClosed
+		}
+	} else if s.sendClosed.Load() {
+		return nil, errStreamClosed
 	}
-	s.pendingMu.Lock()
+	if !s.sendWindow.Acquire(length) {
+		return nil, errStreamClosed
+	}
 	seq := s.sendSeq
 	s.sendSeq += uint64(length)
-	s.pending = append(s.pending, pendingEntry{seq: seq, length: length})
+	frame := &protocol.Frame{
+		Type:     protocol.FrameData,
+		StreamID: s.id,
+		Seq:      seq,
+		Payload:  payload,
+	}
+	if end {
+		frame.Flags |= protocol.FlagEndOfStream
+	}
+	entry := &pendingEntry{seq: seq, length: length, frame: frame}
+	s.pendingMu.Lock()
+	s.pending = append(s.pending, entry)
 	s.pendingMu.Unlock()
-	s.throughput.Add(int64(length))
-	s.inflight.Add(length)
-	return seq, nil
+	if length > 0 {
+		s.throughput.Add(int64(length))
+		s.inflight.Add(length)
+	}
+	return entry, nil
 }
 
-func (s *Stream) onAck(ack *protocol.AckPayload) {
+func (s *Stream) onSendFailure(entry *pendingEntry) {
 	s.pendingMu.Lock()
-	trimIdx := 0
-	for _, entry := range s.pending {
-		end := entry.seq + uint64(entry.length)
-		if ack.AckSeq >= end {
-			trimIdx++
-		} else {
+	for i, pending := range s.pending {
+		if pending == entry {
+			s.pending = append(s.pending[:i], s.pending[i+1:]...)
 			break
 		}
 	}
-	if trimIdx > 0 {
-		s.pending = s.pending[trimIdx:]
+	s.pendingMu.Unlock()
+	if entry.length > 0 {
+		s.sendWindow.Release(entry.length)
+		s.inflight.Add(^uint32(entry.length - 1))
 	}
+}
+
+func (s *Stream) onAck(ack *protocol.AckPayload) {
+	if ack == nil {
+		return
+	}
+	holes := computeAckHoles(ack)
+	now := time.Now()
+	var resend []*pendingEntry
+	s.pendingMu.Lock()
+	filtered := s.pending[:0]
+	for _, entry := range s.pending {
+		if ackCoversEntry(ack, entry) {
+			continue
+		}
+		if shouldRetransmitEntry(entry, holes, now) {
+			resend = append(resend, entry)
+		}
+		filtered = append(filtered, entry)
+	}
+	s.pending = filtered
 	s.pendingMu.Unlock()
 	if ack.Credit > 0 {
 		s.sendWindow.Release(ack.Credit)
 		s.inflight.Add(^uint32(ack.Credit - 1))
 	}
+	for _, entry := range resend {
+		s.session.retransmit(s, entry, now)
+	}
 }
 
 func (s *Stream) onData(frame *protocol.Frame) {
-	ready := s.reorder.Push(frame.Seq, frame.Payload)
-	for _, payload := range ready {
-		select {
-		case s.inbound <- payload:
-		case <-s.done:
+	end := frame.Flags&protocol.FlagEndOfStream != 0
+	for {
+		chunks, err := s.reorder.Push(frame.Seq, frame.Payload, end)
+		if err != nil {
+			if errors.Is(err, ErrReorderOverflow) {
+				s.handleReorderOverflow()
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			s.fail(err)
+			return
 		}
-		if s.session.cfg.Role == RoleServer {
-			// Server acks after data is forwarded to target in pump loop.
-		} else {
-			s.recvSeq += uint64(len(payload))
-			_ = s.session.sendAck(s.id, s.recvSeq, uint32(len(payload)))
+		if len(chunks) == 0 {
+			if err := s.sendAck(0); err != nil {
+				s.fail(err)
+			}
+			return
 		}
+		for _, chunk := range chunks {
+			select {
+			case s.inbound <- chunk:
+			case <-s.done:
+				return
+			}
+		}
+		return
 	}
 }
 
@@ -180,23 +257,31 @@ func (s *Stream) pumpLocalToOverlay() {
 	buf := make([]byte, s.session.cfg.FrameSize)
 	for {
 		n, err := s.local.Read(buf)
+		end := errors.Is(err, io.EOF)
 		if n > 0 {
 			chunk := append([]byte(nil), buf[:n]...)
-			if err := s.session.sendData(s, chunk); err != nil {
-				s.fail(err)
+			if sendErr := s.session.sendData(s, chunk, end); sendErr != nil {
+				if errors.Is(sendErr, errStreamClosed) {
+					s.localDone.Store(true)
+					s.maybeFinalize()
+					return
+				}
+				s.fail(sendErr)
+				return
+			}
+		} else if end {
+			if sendErr := s.session.sendData(s, nil, true); sendErr != nil && !errors.Is(sendErr, errStreamClosed) {
+				s.fail(sendErr)
 				return
 			}
 		}
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
+			if !end {
 				s.fail(err)
+				return
 			}
-			_ = s.session.sendFrame(&protocol.Frame{
-				Type:      protocol.FrameControl,
-				SessionID: s.session.id,
-				StreamID:  s.id,
-				Control:   &protocol.ControlPayload{Type: protocol.ControlStreamClose},
-			})
+			s.localDone.Store(true)
+			s.maybeFinalize()
 			return
 		}
 	}
@@ -205,9 +290,25 @@ func (s *Stream) pumpLocalToOverlay() {
 func (s *Stream) pumpOverlayToLocal() {
 	for {
 		select {
-		case payload := <-s.inbound:
-			if _, err := s.local.Write(payload); err != nil {
+		case chunk := <-s.inbound:
+			if len(chunk.Data) > 0 {
+				if _, err := s.local.Write(chunk.Data); err != nil {
+					s.fail(err)
+					return
+				}
+				s.recvSeq.Add(uint64(len(chunk.Data)))
+				if err := s.sendAck(uint32(len(chunk.Data))); err != nil {
+					s.fail(err)
+					return
+				}
+			} else if err := s.sendAck(0); err != nil {
 				s.fail(err)
+				return
+			}
+			if chunk.End {
+				s.remoteDone.Store(true)
+				s.halfCloseWrite(s.local)
+				s.maybeFinalize()
 				return
 			}
 		case <-s.done:
@@ -219,13 +320,27 @@ func (s *Stream) pumpOverlayToLocal() {
 func (s *Stream) pumpOverlayToTarget() {
 	for {
 		select {
-		case payload := <-s.inbound:
-			if _, err := s.target.Write(payload); err != nil {
+		case chunk := <-s.inbound:
+			if len(chunk.Data) > 0 {
+				if _, err := s.target.Write(chunk.Data); err != nil {
+					s.fail(err)
+					return
+				}
+				s.recvSeq.Add(uint64(len(chunk.Data)))
+				if err := s.sendAck(uint32(len(chunk.Data))); err != nil {
+					s.fail(err)
+					return
+				}
+			} else if err := s.sendAck(0); err != nil {
 				s.fail(err)
 				return
 			}
-			s.recvSeq += uint64(len(payload))
-			_ = s.session.sendAck(s.id, s.recvSeq, uint32(len(payload)))
+			if chunk.End {
+				s.remoteDone.Store(true)
+				s.halfCloseWrite(s.target)
+				s.maybeFinalize()
+				return
+			}
 		case <-s.done:
 			return
 		}
@@ -236,25 +351,69 @@ func (s *Stream) pumpTargetToOverlay() {
 	buf := make([]byte, s.session.cfg.FrameSize)
 	for {
 		n, err := s.target.Read(buf)
+		end := errors.Is(err, io.EOF)
 		if n > 0 {
 			chunk := append([]byte(nil), buf[:n]...)
-			if err := s.session.sendData(s, chunk); err != nil {
-				s.fail(err)
+			if sendErr := s.session.sendData(s, chunk, end); sendErr != nil {
+				if errors.Is(sendErr, errStreamClosed) {
+					s.localDone.Store(true)
+					s.maybeFinalize()
+					return
+				}
+				s.fail(sendErr)
+				return
+			}
+		} else if end {
+			if sendErr := s.session.sendData(s, nil, true); sendErr != nil && !errors.Is(sendErr, errStreamClosed) {
+				s.fail(sendErr)
 				return
 			}
 		}
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
+			if !end {
 				s.fail(err)
+				return
 			}
-			_ = s.session.sendFrame(&protocol.Frame{
-				Type:      protocol.FrameControl,
-				SessionID: s.session.id,
-				StreamID:  s.id,
-				Control:   &protocol.ControlPayload{Type: protocol.ControlStreamClose},
-			})
+			s.localDone.Store(true)
+			s.maybeFinalize()
 			return
 		}
+	}
+}
+
+func (s *Stream) sendAck(credit uint32) error {
+	ranges := s.reorder.SACKRanges()
+	if credit == 0 && len(ranges) == 0 && !s.reorder.HasTerminal() {
+		return nil
+	}
+	ack := &protocol.AckPayload{
+		AckSeq: s.recvSeq.Load(),
+		Credit: credit,
+		Ranges: ranges,
+	}
+	return s.session.sendAck(s.id, ack)
+}
+
+func (s *Stream) handleReorderOverflow() {
+	if err := s.sendAck(0); err != nil {
+		s.fail(err)
+	}
+}
+
+func (s *Stream) halfCloseWrite(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+		return
+	}
+	_ = conn.Close()
+}
+
+func (s *Stream) maybeFinalize() {
+	if s.localDone.Load() && s.remoteDone.Load() {
+		s.close(io.EOF)
 	}
 }
 
@@ -270,4 +429,50 @@ func (s *Stream) openServerSide(target string) error {
 // Done returns a channel that is closed once the stream completes or fails.
 func (s *Stream) Done() <-chan struct{} {
 	return s.done
+}
+
+func computeAckHoles(ack *protocol.AckPayload) []protocol.SACKRange {
+	if ack == nil || len(ack.Ranges) == 0 {
+		return nil
+	}
+	cur := ack.AckSeq
+	holes := make([]protocol.SACKRange, 0, len(ack.Ranges))
+	for _, r := range ack.Ranges {
+		if r.Start > cur {
+			holes = append(holes, protocol.SACKRange{Start: cur, End: r.Start})
+		}
+		if r.End > cur {
+			cur = r.End
+		}
+	}
+	return holes
+}
+
+func ackCoversEntry(ack *protocol.AckPayload, entry *pendingEntry) bool {
+	end := entry.seq + uint64(entry.length)
+	if ack.AckSeq >= end {
+		return true
+	}
+	for _, r := range ack.Ranges {
+		if entry.seq >= r.Start && end <= r.End {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldRetransmitEntry(entry *pendingEntry, holes []protocol.SACKRange, now time.Time) bool {
+	if entry.length == 0 || len(holes) == 0 {
+		return false
+	}
+	if !entry.lastSend.IsZero() && now.Sub(entry.lastSend) < retransmitInterval {
+		return false
+	}
+	end := entry.seq + uint64(entry.length)
+	for _, hole := range holes {
+		if entry.seq < hole.End && end > hole.Start {
+			return true
+		}
+	}
+	return false
 }

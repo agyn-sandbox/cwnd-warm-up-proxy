@@ -11,6 +11,7 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 	buf := new(bytes.Buffer)
 	frame := &Frame{
 		Type:      FrameData,
+		Flags:     FlagEndOfStream,
 		SessionID: 42,
 		StreamID:  7,
 		Seq:       128,
@@ -26,6 +27,9 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 	if decoded.Type != FrameData {
 		t.Fatalf("type mismatch: %v", decoded.Type)
 	}
+	if decoded.Flags&FlagEndOfStream == 0 {
+		t.Fatalf("missing end-of-stream flag")
+	}
 	if string(decoded.Payload) != "hello world" {
 		t.Fatalf("payload mismatch: %s", decoded.Payload)
 	}
@@ -37,8 +41,15 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 func TestDecodeAckFrame(t *testing.T) {
 	buf := new(bytes.Buffer)
 	frame := &Frame{
-		Type:     FrameAck,
-		Ack:      &AckPayload{AckSeq: 512, Credit: 4096},
+		Type: FrameAck,
+		Ack: &AckPayload{
+			AckSeq: 512,
+			Credit: 4096,
+			Ranges: []SACKRange{
+				{Start: 600, End: 700},
+				{Start: 800, End: 900},
+			},
+		},
 		Seq:      33,
 		StreamID: 9,
 	}
@@ -54,6 +65,9 @@ func TestDecodeAckFrame(t *testing.T) {
 	}
 	if decoded.Ack.AckSeq != 512 || decoded.Ack.Credit != 4096 {
 		t.Fatalf("unexpected ack payload: %+v", decoded.Ack)
+	}
+	if len(decoded.Ack.Ranges) != 2 || decoded.Ack.Ranges[0].Start != 600 || decoded.Ack.Ranges[1].End != 900 {
+		t.Fatalf("unexpected sack ranges: %+v", decoded.Ack.Ranges)
 	}
 }
 

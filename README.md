@@ -6,6 +6,13 @@ This repository now targets a SOCKS5 client/server overlay that stripes a single
 - Server: near the target (can be on the same host)
 - Goal: improve throughput on the consumer→server leg using multiple prewarmed connections
 
+## Features
+
+- Selective acknowledgements with retransmission to recover quickly from loss.
+- Bounded reorder buffers and credit-based flow control to cap memory growth under duress.
+- Adaptive weighted scheduler driven by recent goodput to prioritise healthy subflows.
+- Automatic subflow re-dial on the client when a transport path drops.
+
 See SPEC.md for the detailed technical specification (v0.1).
 
 ## Prerequisites

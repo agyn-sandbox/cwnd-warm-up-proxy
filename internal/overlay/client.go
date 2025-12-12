@@ -45,6 +45,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		InitialWindow:     cfg.InitialWindow,
 		HeartbeatInterval: cfg.HeartbeatInterval,
 		WriteTimeout:      cfg.WriteTimeout,
+		SubflowTarget:     cfg.Subflows,
 	}
 	client := &Client{cfg: cfg}
 	dialer := func() (net.Conn, error) {
