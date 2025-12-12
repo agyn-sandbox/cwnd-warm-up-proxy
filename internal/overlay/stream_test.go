@@ -23,8 +23,10 @@ func TestStreamOnAckTriggersRetransmitForSACKHole(t *testing.T) {
 		Conn:    conn,
 		session: sess,
 		closed:  make(chan struct{}),
-		tx:      metrics.NewSlidingCounter(10*time.Second, 500*time.Millisecond),
-		rx:      metrics.NewSlidingCounter(10*time.Second, 500*time.Millisecond),
+		txReal:  metrics.NewSlidingCounter(10*time.Second, 500*time.Millisecond),
+		txDummy: metrics.NewSlidingCounter(10*time.Second, 500*time.Millisecond),
+		rxReal:  metrics.NewSlidingCounter(10*time.Second, 500*time.Millisecond),
+		rxDummy: metrics.NewSlidingCounter(10*time.Second, 500*time.Millisecond),
 	}
 	sess.scheduler.Attach(sf)
 

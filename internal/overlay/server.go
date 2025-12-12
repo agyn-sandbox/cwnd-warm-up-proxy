@@ -3,6 +3,7 @@ package overlay
 import (
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -132,15 +133,24 @@ func (s *Server) Close() error {
 	return s.listener.Close()
 }
 
-// Snapshot implements tui.Provider to surface aggregate metrics.
 func (s *Server) Snapshot() tui.Snapshot {
-	snap := tui.Snapshot{Timestamp: time.Now()}
 	s.sessionsMu.Lock()
+	sessions := make([]*Session, 0, len(s.sessions))
 	for _, sess := range s.sessions {
-		ss := sess.Snapshot()
-		snap.Subflows = append(snap.Subflows, ss.Subflows...)
-		snap.Streams = append(snap.Streams, ss.Streams...)
+		sessions = append(sessions, sess)
 	}
 	s.sessionsMu.Unlock()
-	return snap
+	lines := make([]string, 0, len(sessions)*4+1)
+	lines = append(lines, fmt.Sprintf("active sessions=%d", len(sessions)))
+	for _, sess := range sessions {
+		ss := sess.Snapshot()
+		for _, line := range ss.Lines {
+			lines = append(lines, fmt.Sprintf("session %08x | %s", sess.id, line))
+		}
+	}
+	return tui.Snapshot{
+		Timestamp: time.Now(),
+		Title:     "overlay server",
+		Lines:     lines,
+	}
 }

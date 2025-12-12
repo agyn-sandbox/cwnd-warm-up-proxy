@@ -10,15 +10,15 @@ import (
 func TestSchedulerWeightsFollowGoodput(t *testing.T) {
 	sched := NewScheduler()
 	fast := &Subflow{
-		ID: 0,
-		tx: metrics.NewSlidingCounter(10*time.Second, 500*time.Millisecond),
+		ID:     0,
+		txReal: metrics.NewSlidingCounter(10*time.Second, 500*time.Millisecond),
 	}
 	slow := &Subflow{
-		ID: 1,
-		tx: metrics.NewSlidingCounter(10*time.Second, 500*time.Millisecond),
+		ID:     1,
+		txReal: metrics.NewSlidingCounter(10*time.Second, 500*time.Millisecond),
 	}
-	fast.tx.Add(int64(weightQuantum) * 10)
-	slow.tx.Add(int64(weightQuantum) / 10)
+	fast.txReal.Add(int64(weightQuantum) * 10)
+	slow.txReal.Add(int64(weightQuantum) / 10)
 
 	sched.Attach(fast)
 	sched.Attach(slow)

@@ -55,7 +55,7 @@ const (
 
 func (s *Scheduler) refreshWeightsLocked() {
 	for _, entry := range s.entries {
-		throughput := entry.ref.tx.Sum()
+		throughput := entry.ref.txReal.Sum()
 		weight := weightFromThroughput(throughput)
 		if weight != entry.weight {
 			entry.weight = weight
