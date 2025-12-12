@@ -108,6 +108,40 @@ frame.
      -file "$FILE"
    ```
 
+## Live metrics dashboards
+
+Each binary now ships with a lightweight terminal dashboard that refreshes every
+500 ms over a 10 second sliding window. Real bytes represent stream payload, and
+dummy bytes cover heartbeats, probes, frame headers, and retransmissions.
+
+- **Overlay client & server** — enabled by default (`-tui=true`). The dashboard
+  lists per-subflow transmit/receive rates split into real/dummy bytes alongside
+  aggregate totals and active stream throughput. Disable with `-tui=false` if a
+  quiet console is preferred.
+
+  ```bash
+  go run ./cmd/server -listen :8443 -cert server.crt -key server.key -tui
+  go run ./cmd/client -server 127.0.0.1:8443 -listen 127.0.0.1:1080 -tui
+  ```
+
+- **test-consumer** — shows live upload progress (bytes sent, average/instant
+  throughput, server response) with dummy bytes fixed at zero. Toggle via the
+  `-tui` flag.
+
+  ```bash
+  go run ./cmd/test-consumer -target http://127.0.0.1:9000/upload -tui
+  ```
+
+- **test-target** — reports bytes received, request rates, and the most recent
+  upload size/duration with dummy bytes fixed at zero. Toggle via `-tui`.
+
+  ```bash
+  go run ./cmd/test-target -listen 127.0.0.1:9000 -tui
+  ```
+
+Dashboards emit to stdout, so run each binary in its own terminal when
+observability is needed.
+
 ## Full local walkthrough (test harness)
 
 The repository ships two helper binaries to exercise the overlay end-to-end:

@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/agyn-sandbox/cwnd-warm-up-proxy/internal/metrics"
 	"github.com/agyn-sandbox/cwnd-warm-up-proxy/internal/overlay/protocol"
 	"github.com/agyn-sandbox/cwnd-warm-up-proxy/internal/tui"
 )
@@ -69,6 +71,7 @@ type Session struct {
 	Dialer Dialer
 
 	metricsWindow time.Duration
+	metricsStep   time.Duration
 }
 
 type inboundFrame struct {
@@ -103,6 +106,7 @@ func newSession(cfg SessionConfig, dialer Dialer) *Session {
 		done:          make(chan struct{}),
 		Dialer:        dialer,
 		metricsWindow: 10 * time.Second,
+		metricsStep:   500 * time.Millisecond,
 	}
 	if s.id == 0 {
 		s.id = randomSessionID()
@@ -443,6 +447,7 @@ func (s *Session) sendData(stream *Stream, payload []byte, end bool) error {
 		return err
 	}
 	entry.frame.SessionID = s.id
+	entry.frame.IsDuplicate = false
 	if err := s.sendFrame(entry.frame); err != nil {
 		stream.onSendFailure(entry)
 		return err
@@ -464,6 +469,7 @@ func (s *Session) sendAck(streamID uint32, ack *protocol.AckPayload) error {
 
 func (s *Session) retransmit(stream *Stream, entry *pendingEntry, now time.Time) {
 	entry.frame.SessionID = s.id
+	entry.frame.IsDuplicate = true
 	if err := s.sendFrame(entry.frame); err != nil {
 		stream.fail(err)
 		return
@@ -471,29 +477,108 @@ func (s *Session) retransmit(stream *Stream, entry *pendingEntry, now time.Time)
 	entry.lastSend = now
 }
 
+func (s *Session) snapshotTitle() string {
+	switch s.cfg.Role {
+	case RoleClient:
+		return "overlay client"
+	case RoleServer:
+		return "overlay server"
+	default:
+		return "overlay session"
+	}
+}
+
 // Snapshot implements tui.Provider.
 func (s *Session) Snapshot() tui.Snapshot {
-	snap := tui.Snapshot{Timestamp: time.Now()}
+	windowSeconds := s.metricsWindow.Seconds()
+	if windowSeconds <= 0 {
+		windowSeconds = 1
+	}
+	rate := func(c *metrics.SlidingCounter) float64 {
+		if c == nil {
+			return 0
+		}
+		return float64(c.Sum()) / windowSeconds
+	}
+
 	s.subflowsMu.RLock()
+	subflows := make([]*Subflow, 0, len(s.subflows))
 	for _, sf := range s.subflows {
-		throughput := float64(sf.tx.Sum()) / s.metricsWindow.Seconds()
-		snap.Subflows = append(snap.Subflows, tui.SubflowStat{
-			ID:         sf.ID,
-			RTT:        0,
-			Throughput: throughput,
-		})
+		subflows = append(subflows, sf)
 	}
 	s.subflowsMu.RUnlock()
+	sort.Slice(subflows, func(i, j int) bool { return subflows[i].ID < subflows[j].ID })
+
+	var totalTxReal, totalTxDummy, totalRxReal, totalRxDummy float64
+	lines := make([]string, 0, len(subflows)+8)
+	for _, sf := range subflows {
+		txReal := rate(sf.txReal)
+		txDummy := rate(sf.txDummy)
+		rxReal := rate(sf.rxReal)
+		rxDummy := rate(sf.rxDummy)
+		totalTxReal += txReal
+		totalTxDummy += txDummy
+		totalRxReal += rxReal
+		totalRxDummy += rxDummy
+		lines = append(lines, fmt.Sprintf(
+			"subflow %d | tx real=%s dummy=%s | rx real=%s dummy=%s",
+			sf.ID,
+			tui.FormatRate(txReal),
+			tui.FormatRate(txDummy),
+			tui.FormatRate(rxReal),
+			tui.FormatRate(rxDummy),
+		))
+	}
+
+	summary := fmt.Sprintf(
+		"totals | tx real=%s dummy=%s | rx real=%s dummy=%s",
+		tui.FormatRate(totalTxReal),
+		tui.FormatRate(totalTxDummy),
+		tui.FormatRate(totalRxReal),
+		tui.FormatRate(totalRxDummy),
+	)
+	lines = append([]string{summary, fmt.Sprintf("subflows active=%d", len(subflows))}, lines...)
+
 	s.streamsMu.RLock()
-	for id, stream := range s.streams {
-		throughput := float64(stream.throughput.Sum()) / s.metricsWindow.Seconds()
+	streamIDs := make([]uint32, 0, len(s.streams))
+	for id := range s.streams {
+		streamIDs = append(streamIDs, id)
+	}
+	s.sortStreamsUnlocked(streamIDs)
+	var totalOutstanding uint32
+	var totalStreamThroughput float64
+	for _, id := range streamIDs {
+		stream := s.streams[id]
+		throughput := float64(stream.throughput.Sum()) / windowSeconds
 		outstanding := stream.inflight.Load()
-		snap.Streams = append(snap.Streams, tui.StreamStat{
-			ID:          id,
-			Outstanding: outstanding,
-			Throughput:  throughput,
-		})
+		totalOutstanding += outstanding
+		totalStreamThroughput += throughput
+		lines = append(lines, fmt.Sprintf(
+			"stream %d | outstanding=%d throughput=%s",
+			id,
+			outstanding,
+			tui.FormatRate(throughput),
+		))
 	}
 	s.streamsMu.RUnlock()
-	return snap
+	if len(streamIDs) > 0 {
+		lines = append(lines, fmt.Sprintf(
+			"streams summary | active=%d inflight=%d throughput=%s",
+			len(streamIDs),
+			totalOutstanding,
+			tui.FormatRate(totalStreamThroughput),
+		))
+	} else {
+		lines = append(lines, "streams active=0")
+	}
+
+	return tui.Snapshot{
+		Timestamp: time.Now(),
+		Title:     s.snapshotTitle(),
+		Lines:     lines,
+	}
+}
+
+func (s *Session) sortStreamsUnlocked(ids []uint32) {
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 }

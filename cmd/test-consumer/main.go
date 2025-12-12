@@ -14,12 +14,160 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/agyn-sandbox/cwnd-warm-up-proxy/internal/metrics"
+	"github.com/agyn-sandbox/cwnd-warm-up-proxy/internal/tui"
 )
 
 const (
 	defaultPayloadSize = 5 * 1024 * 1024
 )
+
+type consumerMetrics struct {
+	window time.Duration
+	step   time.Duration
+
+	txReal  *metrics.SlidingCounter
+	txDummy *metrics.SlidingCounter
+
+	totalReal  atomic.Int64
+	totalDummy atomic.Int64
+
+	mu           sync.Mutex
+	start        time.Time
+	mode         string
+	target       string
+	totalBytes   int64
+	lastResp     uploadResponse
+	lastDuration time.Duration
+	err          error
+	done         bool
+}
+
+func newConsumerMetrics(mode, target string) *consumerMetrics {
+	window := 10 * time.Second
+	step := 500 * time.Millisecond
+	return &consumerMetrics{
+		window:  window,
+		step:    step,
+		txReal:  metrics.NewSlidingCounter(window, step),
+		txDummy: metrics.NewSlidingCounter(window, step),
+		mode:    mode,
+		target:  target,
+	}
+}
+
+func (m *consumerMetrics) Start(total int64) {
+	m.mu.Lock()
+	if m.start.IsZero() {
+		m.start = time.Now()
+		m.totalBytes = total
+	}
+	m.mu.Unlock()
+}
+
+func (m *consumerMetrics) WrapReader(r io.Reader) io.Reader {
+	return io.TeeReader(r, &metricsRecorder{metrics: m})
+}
+
+func (m *consumerMetrics) recordReal(n int) {
+	if n <= 0 {
+		return
+	}
+	m.txReal.Add(int64(n))
+	m.totalReal.Add(int64(n))
+}
+
+func (m *consumerMetrics) recordDummy(n int) {
+	if n <= 0 {
+		return
+	}
+	m.txDummy.Add(int64(n))
+	m.totalDummy.Add(int64(n))
+}
+
+func (m *consumerMetrics) RecordError(err error) {
+	m.mu.Lock()
+	m.err = err
+	m.done = true
+	m.mu.Unlock()
+}
+
+func (m *consumerMetrics) RecordResult(resp uploadResponse, elapsed time.Duration) {
+	m.mu.Lock()
+	m.lastResp = resp
+	m.lastDuration = elapsed
+	m.done = true
+	m.mu.Unlock()
+}
+
+func (m *consumerMetrics) Snapshot() tui.Snapshot {
+	windowSeconds := m.window.Seconds()
+	if windowSeconds <= 0 {
+		windowSeconds = 1
+	}
+	mode, target, start, totalBytes, lastResp, lastDuration, err, done := m.snapshotState()
+	realTotal := m.totalReal.Load()
+	dummyTotal := m.totalDummy.Load()
+	realRate := float64(m.txReal.Sum()) / windowSeconds
+	dummyRate := float64(m.txDummy.Sum()) / windowSeconds
+	var elapsed time.Duration
+	if !start.IsZero() {
+		elapsed = time.Since(start)
+	}
+	avgRate := 0.0
+	if elapsed > 0 {
+		avgRate = float64(realTotal) / elapsed.Seconds()
+	}
+	progress := "-"
+	if totalBytes > 0 {
+		ratio := float64(realTotal) / float64(totalBytes)
+		if ratio > 1 {
+			ratio = 1
+		}
+		progress = fmt.Sprintf("%.1f%%", ratio*100)
+	}
+	lines := []string{
+		fmt.Sprintf("mode=%s target=%s", mode, target),
+		fmt.Sprintf("elapsed=%s avg_real=%s progress=%s", tui.FormatDuration(elapsed), tui.FormatRate(avgRate), progress),
+		fmt.Sprintf("tx real: rate=%s total=%s", tui.FormatRate(realRate), tui.FormatBytes(realTotal)),
+		fmt.Sprintf("tx dummy: rate=%s total=%s", tui.FormatRate(dummyRate), tui.FormatBytes(dummyTotal)),
+	}
+	if done {
+		lines = append(lines, fmt.Sprintf("last upload: bytes=%d duration=%s server_time=%dms", lastResp.BytesReceived, tui.FormatDuration(lastDuration), lastResp.ServerTimeMS))
+	}
+	if err != nil {
+		lines = append(lines, fmt.Sprintf("error: %v", err))
+	}
+	if !done && start.IsZero() {
+		lines = append(lines, "status=waiting for upload")
+	}
+	return tui.Snapshot{
+		Timestamp: time.Now(),
+		Title:     "test-consumer",
+		Lines:     lines,
+	}
+}
+
+func (m *consumerMetrics) snapshotState() (mode, target string, start time.Time, total int64, last uploadResponse, lastDur time.Duration, err error, done bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.mode, m.target, m.start, m.totalBytes, m.lastResp, m.lastDuration, m.err, m.done
+}
+
+type metricsRecorder struct {
+	metrics *consumerMetrics
+}
+
+func (r *metricsRecorder) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		r.metrics.recordReal(len(p))
+	}
+	return len(p), nil
+}
 
 type consumerFlags struct {
 	target    string
@@ -27,6 +175,7 @@ type consumerFlags struct {
 	useSocks  bool
 	socksAddr string
 	timeout   time.Duration
+	showTUI   bool
 }
 
 func parseFlags() consumerFlags {
@@ -36,6 +185,7 @@ func parseFlags() consumerFlags {
 	flag.BoolVar(&cfg.useSocks, "use-socks", false, "route traffic through SOCKS5 proxy")
 	flag.StringVar(&cfg.socksAddr, "socks", "127.0.0.1:1080", "SOCKS5 proxy address")
 	flag.DurationVar(&cfg.timeout, "timeout", 60*time.Second, "request timeout")
+	flag.BoolVar(&cfg.showTUI, "tui", true, "render live metrics dashboard")
 	flag.Parse()
 	return cfg
 }
@@ -58,17 +208,32 @@ func main() {
 	if err != nil {
 		log.Fatalf("http client: %v", err)
 	}
+	mode := "direct"
+	if cfg.useSocks {
+		mode = fmt.Sprintf("SOCKS %s", cfg.socksAddr)
+	}
+
+	var dashboard *tui.Dashboard
+	var meter *consumerMetrics
+	if cfg.showTUI {
+		meter = newConsumerMetrics(mode, cfg.target)
+		dashboard = tui.NewDashboard(meter, os.Stdout, 500*time.Millisecond)
+		dashboard.Start()
+		defer dashboard.Stop()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
 	defer cancel()
 
-	resp, elapsed, err := performUpload(ctx, client, cfg.target, payloadFile)
+	resp, elapsed, err := performUpload(ctx, client, cfg.target, payloadFile, meter)
 	if err != nil {
+		if meter != nil {
+			meter.RecordError(err)
+		}
 		log.Fatalf("upload failed: %v", err)
 	}
-	mode := "direct"
-	if cfg.useSocks {
-		mode = fmt.Sprintf("SOCKS %s", cfg.socksAddr)
+	if meter != nil {
+		meter.RecordResult(resp, elapsed)
 	}
 	log.Printf("mode: %s", mode)
 	log.Printf("client_time_ms=%d", elapsed.Milliseconds())
@@ -139,7 +304,7 @@ func newHTTPClient(cfg consumerFlags) (*http.Client, error) {
 	return &http.Client{Transport: transport}, nil
 }
 
-func performUpload(ctx context.Context, client *http.Client, target, filePath string) (uploadResponse, time.Duration, error) {
+func performUpload(ctx context.Context, client *http.Client, target, filePath string, meter *consumerMetrics) (uploadResponse, time.Duration, error) {
 	var out uploadResponse
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -150,7 +315,12 @@ func performUpload(ctx context.Context, client *http.Client, target, filePath st
 	if err != nil {
 		return out, 0, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, file)
+	body := io.Reader(file)
+	if meter != nil {
+		meter.Start(info.Size())
+		body = meter.WrapReader(file)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, body)
 	if err != nil {
 		return out, 0, err
 	}

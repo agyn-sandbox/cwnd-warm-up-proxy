@@ -39,7 +39,7 @@ func TestPerformUploadDirect(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	resp, elapsed, err := performUpload(ctx, client, server.URL, file)
+	resp, elapsed, err := performUpload(ctx, client, server.URL, file, nil)
 	if err != nil {
 		t.Fatalf("perform upload: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestPerformUploadViaSocks(t *testing.T) {
 	file := tempFile(t, 1024)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	resp, _, err := performUpload(ctx, client, backend.URL, file)
+	resp, _, err := performUpload(ctx, client, backend.URL, file, nil)
 	if err != nil {
 		t.Fatalf("perform upload: %v", err)
 	}

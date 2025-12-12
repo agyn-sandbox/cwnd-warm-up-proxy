@@ -20,6 +20,9 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 	if err := frame.Encode(buf); err != nil {
 		t.Fatalf("encode: %v", err)
 	}
+	if frame.WireLength == 0 {
+		t.Fatalf("expected wire length to be recorded")
+	}
 	decoded, err := Decode(bytes.NewReader(buf.Bytes()))
 	if err != nil {
 		t.Fatalf("decode: %v", err)
@@ -35,6 +38,9 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 	}
 	if decoded.SessionID != 42 || decoded.StreamID != 7 || decoded.Seq != 128 {
 		t.Fatalf("header mismatch: %+v", decoded)
+	}
+	if decoded.WireLength != frame.WireLength {
+		t.Fatalf("wire length mismatch: got %d want %d", decoded.WireLength, frame.WireLength)
 	}
 }
 
@@ -69,6 +75,9 @@ func TestDecodeAckFrame(t *testing.T) {
 	if len(decoded.Ack.Ranges) != 2 || decoded.Ack.Ranges[0].Start != 600 || decoded.Ack.Ranges[1].End != 900 {
 		t.Fatalf("unexpected sack ranges: %+v", decoded.Ack.Ranges)
 	}
+	if decoded.WireLength <= HeaderSize {
+		t.Fatalf("expected positive payload size, got %d", decoded.WireLength)
+	}
 }
 
 func TestDecodeControlFrame(t *testing.T) {
@@ -97,6 +106,9 @@ func TestDecodeControlFrame(t *testing.T) {
 	if decoded.Control.Metadata["addr"] != "example.com:80" {
 		t.Fatalf("metadata mismatch: %v", decoded.Control.Metadata)
 	}
+	if decoded.WireLength <= HeaderSize {
+		t.Fatalf("expected wire length to include payload")
+	}
 }
 
 func TestDecodeHeartbeat(t *testing.T) {
@@ -115,6 +127,9 @@ func TestDecodeHeartbeat(t *testing.T) {
 	}
 	if decoded.Heartbeat.UnixNanos != ts {
 		t.Fatalf("timestamp mismatch: %d != %d", decoded.Heartbeat.UnixNanos, ts)
+	}
+	if decoded.WireLength <= HeaderSize {
+		t.Fatalf("expected heartbeat frame wire length to exceed header")
 	}
 }
 
@@ -143,6 +158,9 @@ func TestEncodeDecodeWithChecksum(t *testing.T) {
 	}
 	if !bytes.Equal(decoded.Payload, []byte("checksum payload")) {
 		t.Fatalf("payload mismatch: %s", decoded.Payload)
+	}
+	if decoded.WireLength <= HeaderSize {
+		t.Fatalf("expected encoded length with checksum")
 	}
 }
 

@@ -9,7 +9,7 @@ import (
 )
 
 func TestUploadEndpoint(t *testing.T) {
-	server := httptest.NewServer(newMux())
+	server := httptest.NewServer(newMux(nil))
 	defer server.Close()
 	payload := bytes.Repeat([]byte("a"), 1024)
 	resp, err := http.Post(server.URL+"/upload", "application/octet-stream", bytes.NewReader(payload))
@@ -33,7 +33,7 @@ func TestUploadEndpoint(t *testing.T) {
 }
 
 func TestHealthEndpoint(t *testing.T) {
-	server := httptest.NewServer(newMux())
+	server := httptest.NewServer(newMux(nil))
 	defer server.Close()
 	resp, err := http.Get(server.URL + "/health")
 	if err != nil {

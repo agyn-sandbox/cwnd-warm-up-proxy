@@ -3,27 +3,16 @@ package tui
 import (
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 )
 
-// Snapshot holds aggregated runtime metrics exposed by the overlay.
+// Snapshot represents a rendered view of runtime metrics.
 type Snapshot struct {
 	Timestamp time.Time
-	Subflows  []SubflowStat
-	Streams   []StreamStat
-}
-
-type SubflowStat struct {
-	ID         int
-	RTT        time.Duration
-	Throughput float64 // bytes/sec
-}
-
-type StreamStat struct {
-	ID          uint32
-	Outstanding uint32
-	Throughput  float64
+	Title     string
+	Lines     []string
 }
 
 // Provider yields new snapshots when invoked.
@@ -66,12 +55,17 @@ func (d *Dashboard) loop() {
 				continue
 			}
 			snap := d.Provider.Snapshot()
-			fmt.Fprintf(d.Writer, "\n[%s] Subflows:%d Streams:%d\n", snap.Timestamp.Format(time.RFC3339), len(snap.Subflows), len(snap.Streams))
-			for _, sf := range snap.Subflows {
-				fmt.Fprintf(d.Writer, "  sf=%d rtt=%s throughput=%.2fBps\n", sf.ID, sf.RTT, sf.Throughput)
+			title := snap.Title
+			if title == "" {
+				title = "metrics"
 			}
-			for _, st := range snap.Streams {
-				fmt.Fprintf(d.Writer, "  stream=%d outstanding=%d throughput=%.2fBps\n", st.ID, st.Outstanding, st.Throughput)
+			fmt.Fprintf(d.Writer, "\n[%s] %s\n", snap.Timestamp.Format(time.RFC3339), title)
+			for _, line := range snap.Lines {
+				line = strings.TrimRight(line, "\n")
+				if line == "" {
+					continue
+				}
+				fmt.Fprintf(d.Writer, "  %s\n", line)
 			}
 		case <-d.stop:
 			return

@@ -71,6 +71,13 @@ type Frame struct {
 	Payload   []byte
 	Checksum  uint32
 
+	// IsDuplicate is used internally to flag retransmitted frames. It is not
+	// serialized on the wire.
+	IsDuplicate bool
+	// WireLength records the encoded frame size (including header and checksum)
+	// for observability purposes.
+	WireLength int
+
 	Ack       *AckPayload
 	Control   *ControlPayload
 	Heartbeat *HeartbeatPayload
@@ -139,11 +146,12 @@ func (f *Frame) Encode(w io.Writer) error {
 	binary.BigEndian.PutUint32(header[8:12], f.StreamID)
 	binary.BigEndian.PutUint64(header[12:20], f.Seq)
 	binary.BigEndian.PutUint32(header[20:24], uint32(len(payload)))
-	if _, err := w.Write(header); err != nil {
+	cw := &countingWriter{w: w}
+	if _, err := cw.Write(header); err != nil {
 		return err
 	}
 	if len(payload) > 0 {
-		if _, err := w.Write(payload); err != nil {
+		if _, err := cw.Write(payload); err != nil {
 			return err
 		}
 	}
@@ -153,10 +161,11 @@ func (f *Frame) Encode(w io.Writer) error {
 		f.Checksum = sum
 		var trailer [4]byte
 		binary.BigEndian.PutUint32(trailer[:], sum)
-		if _, err := w.Write(trailer[:]); err != nil {
+		if _, err := cw.Write(trailer[:]); err != nil {
 			return err
 		}
 	}
+	f.WireLength = cw.written
 	return nil
 }
 
@@ -227,12 +236,14 @@ func Decode(r io.Reader) (*Frame, error) {
 		return nil, errPayloadTooLarge
 	}
 	var buf []byte
+	payloadLen := int(length)
 	if length > 0 {
 		buf = make([]byte, length)
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return nil, err
 		}
 	}
+	checksumLen := 0
 	if frame.Flags&FlagChecksumPresent != 0 {
 		var trailer [4]byte
 		if _, err := io.ReadFull(r, trailer[:]); err != nil {
@@ -245,6 +256,7 @@ func Decode(r io.Reader) (*Frame, error) {
 			return nil, fmt.Errorf("overlay/protocol: checksum mismatch (got %08x want %08x)", sum, expected)
 		}
 		frame.Checksum = expected
+		checksumLen = 4
 	}
 	switch frame.Type {
 	case FrameData:
@@ -290,6 +302,7 @@ func Decode(r io.Reader) (*Frame, error) {
 	default:
 		return nil, errInvalidFrameType
 	}
+	frame.WireLength = HeaderSize + payloadLen + checksumLen
 	return frame, nil
 }
 
@@ -304,4 +317,15 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+type countingWriter struct {
+	w       io.Writer
+	written int
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.written += n
+	return n, err
 }
