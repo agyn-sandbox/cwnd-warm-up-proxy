@@ -55,8 +55,8 @@ See SPEC.md for the detailed technical specification (v0.1).
 4. **Configure a tool or browser to use the SOCKS proxy.** For example:
 
    ```bash
-  curl --socks5 127.0.0.1:1080 https://example.com/
-  ```
+   curl --socks5 127.0.0.1:1080 https://example.com/
+   ```
 
 ## Full local walkthrough (test harness)
 
