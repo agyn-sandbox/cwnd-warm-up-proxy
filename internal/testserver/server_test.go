@@ -163,6 +163,56 @@ func TestUploadUpdatesStats(t *testing.T) {
 	}
 }
 
+func TestWarmupUploadReadsStream(t *testing.T) {
+	cfg := Config{Port: 0, SupportHTTP11: true, SupportH2C: true}
+	srv, cancel, errCh := startServer(t, cfg)
+	defer stopServer(t, cancel, errCh)
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	defer client.CloseIdleConnections()
+
+	payload := bytes.Repeat([]byte("z"), 2048)
+	req, err := http.NewRequest(http.MethodPost, "http://"+srv.Address()+"/warmup-upload", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("post warmup upload: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	}
+
+	var output struct {
+		Bytes      uint64  `json:"bytes"`
+		DurationMS float64 `json:"duration_ms"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&output); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if output.Bytes != uint64(len(payload)) {
+		t.Fatalf("expected bytes %d, got %d", len(payload), output.Bytes)
+	}
+	if output.DurationMS <= 0 {
+		t.Fatalf("expected positive duration_ms")
+	}
+
+	time.Sleep(600 * time.Millisecond)
+
+	snap := srv.Stats().Snapshot()
+	if snap.TotalUploads != 1 {
+		t.Fatalf("expected total uploads 1, got %d", snap.TotalUploads)
+	}
+	if snap.TotalBytes != uint64(len(payload)) {
+		t.Fatalf("expected total bytes %d, got %d", len(payload), snap.TotalBytes)
+	}
+}
+
 func TestH2CSupportsUpload(t *testing.T) {
 	cfg := Config{Port: 0, SupportHTTP11: true, SupportH2C: true}
 	srv, cancel, errCh := startServer(t, cfg)

@@ -60,6 +60,7 @@ func New(cfg Config) (*Server, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleIndex)
 	mux.HandleFunc("/upload", srv.handleUpload)
+	mux.HandleFunc("/warmup-upload", srv.handleWarmupUpload)
 
 	handler := http.Handler(mux)
 	if !cfg.SupportHTTP11 {
@@ -201,6 +202,31 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	duration := time.Since(start)
+	s.respondWithUpload(w, total, duration)
+}
+
+func (s *Server) handleWarmupUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	defer r.Body.Close()
+	start := time.Now()
+	written, err := io.Copy(io.Discard, r.Body)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		http.Error(w, fmt.Sprintf("read body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	duration := time.Since(start)
+	s.respondWithUpload(w, uint64(written), duration)
+}
+
+func (s *Server) respondWithUpload(w http.ResponseWriter, total uint64, duration time.Duration) {
 	completedAt := time.Now()
 	s.stats.RecordUpload(total, duration, completedAt)
 	s.sampler.Record(completedAt)
